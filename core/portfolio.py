@@ -1,6 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 
 from core.database import get_connection
+from core.prices import get_latest_price
 
 
 def register_user(discord_id: str, username: str):
@@ -347,3 +348,163 @@ def get_portfolio(discord_id: str):
             "cash_balance": Decimal(user["cash_balance_cents"]) / 100,
             "holdings": holdings
         }
+
+def get_valued_portfolio(discord_id: str):
+    """
+    Retrieve a user's portfolio with current stored market prices.
+
+    Calculates individual holding values and total portfolio value.
+    """
+
+    # Retrieve the user's existing portfolio.
+    portfolio = get_portfolio(discord_id)
+
+    holdings_value = Decimal("0")
+    valued_holdings = {}
+
+    # Calculate the market value of each holding.
+    for symbol, quantity in portfolio["holdings"].items():
+
+        price = get_latest_price(symbol)
+
+        market_value = quantity * price
+
+        valued_holdings[symbol] = {
+            "quantity": quantity,
+            "price": price,
+            "market_value": market_value
+        }
+
+        holdings_value += market_value
+
+    # Calculate total portfolio value.
+    total_value = portfolio["cash_balance"] + holdings_value
+
+    return {
+        "discord_id": portfolio["discord_id"],
+        "username": portfolio["username"],
+        "cash_balance": portfolio["cash_balance"],
+        "holdings": valued_holdings,
+        "holdings_value": holdings_value,
+        "total_value": total_value
+    }
+
+def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
+    """
+    Save a daily snapshot of a user's portfolio.
+
+    Records cash, holdings value, and total portfolio value.
+    """
+
+    # Retrieve the user's current portfolio valuation.
+    portfolio = get_valued_portfolio(discord_id)
+
+    # Convert dollar values into integer cents.
+    cash_cents = int(
+        (portfolio["cash_balance"] * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+    holdings_cents = int(
+        (portfolio["holdings_value"] * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+    total_cents = cash_cents + holdings_cents
+
+    with get_connection() as connection:
+
+        connection.execute("""
+            INSERT INTO portfolio_snapshots (
+                discord_id,
+                snapshot_date,
+                cash_balance_cents,
+                holdings_value_cents,
+                total_value_cents
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(discord_id, snapshot_date)
+            DO UPDATE SET
+                cash_balance_cents = excluded.cash_balance_cents,
+                holdings_value_cents = excluded.holdings_value_cents,
+                total_value_cents = excluded.total_value_cents
+        """, (
+            discord_id,
+            snapshot_date,
+            cash_cents,
+            holdings_cents,
+            total_cents
+        ))
+
+    return {
+        "discord_id": discord_id,
+        "snapshot_date": snapshot_date,
+        "cash_balance": Decimal(cash_cents) / 100,
+        "holdings_value": Decimal(holdings_cents) / 100,
+        "total_value": Decimal(total_cents) / 100
+    }
+
+def get_active_symbols():
+    """
+    Retrieve every stock currently held by at least
+    one active league participant.
+    """
+
+    with get_connection() as connection:
+
+        trades = connection.execute("""
+            SELECT
+                trades.discord_id,
+                trades.symbol,
+                trades.side,
+                trades.quantity
+            FROM trades
+            JOIN users
+                ON trades.discord_id = users.discord_id
+            WHERE users.is_active = 1
+        """).fetchall()
+
+        holdings = {}
+
+        for trade in trades:
+            key = (trade["discord_id"], trade["symbol"])
+
+            if key not in holdings:
+                holdings[key] = Decimal("0")
+
+            quantity = Decimal(trade["quantity"])
+
+            if trade["side"] == "BUY":
+                holdings[key] += quantity
+            else:
+                holdings[key] -= quantity
+
+        symbols = {
+            symbol
+            for (discord_id, symbol), quantity in holdings.items()
+            if quantity > 0
+        }
+
+        return sorted(symbols)
+
+
+def get_active_users():
+    """
+    Retrieve the Discord IDs of all active league participants.
+    """
+
+    with get_connection() as connection:
+
+        users = connection.execute("""
+            SELECT discord_id
+            FROM users
+            WHERE is_active = 1
+            ORDER BY discord_id
+        """).fetchall()
+
+        return [user["discord_id"] for user in users]
