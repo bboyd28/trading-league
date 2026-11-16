@@ -5,7 +5,6 @@ import core.database as database
 import core.portfolio as portfolio
 
 
-@pytest.fixture
 def setup_database(tmp_path, monkeypatch):
     """
     Create a fresh temporary database for each test.
@@ -226,8 +225,12 @@ def test_save_portfolio_snapshot(setup_database, monkeypatch):
     # Pretend AAPL's latest stored price is $110.
     monkeypatch.setattr(
         portfolio,
-        "get_latest_price",
-        lambda symbol: Decimal("110")
+        "get_price_on_or_before",
+        lambda symbol, target_date: {
+            "symbol": symbol,
+            "price_date": "2026-11-13",
+            "price": Decimal("110")
+        }
     )
 
     result = portfolio.save_portfolio_snapshot(
@@ -254,8 +257,12 @@ def test_update_existing_snapshot(setup_database, monkeypatch):
     # First snapshot: AAPL is worth $110.
     monkeypatch.setattr(
         portfolio,
-        "get_latest_price",
-        lambda symbol: Decimal("110")
+        "get_price_on_or_before",
+        lambda symbol, target_date: {
+            "symbol": symbol,
+            "price_date": "2026-11-13",
+            "price": Decimal("110")
+        }
     )
 
     portfolio.save_portfolio_snapshot(
@@ -266,8 +273,12 @@ def test_update_existing_snapshot(setup_database, monkeypatch):
     # Second snapshot: AAPL is now worth $120.
     monkeypatch.setattr(
         portfolio,
-        "get_latest_price",
-        lambda symbol: Decimal("120")
+        "get_price_on_or_before",
+        lambda symbol, target_date: {
+            "symbol": symbol,
+            "price_date": "2026-11-14",
+            "price": Decimal("120")
+        }
     )
 
     result = portfolio.save_portfolio_snapshot(
@@ -275,8 +286,8 @@ def test_update_existing_snapshot(setup_database, monkeypatch):
         "2026-11-14"
     )
 
-    assert result["holdings_value"] == Decimal("240")
-    assert result["total_value"] == Decimal("100039.80")
+    assert result["holdings_value"] == Decimal("220")
+    assert result["total_value"] == Decimal("100019.80")
 
     with database.get_connection() as connection:
         snapshots = connection.execute("""
@@ -329,3 +340,180 @@ def test_get_active_users(setup_database):
         """)
 
     assert portfolio.get_active_users() == ["111"]
+
+
+def test_historical_valuation(setup_database, monkeypatch):
+    """
+    Verify that a portfolio is valued using historical prices
+    and only includes trades on or before the target date.
+    """
+
+    # Register a test participant.
+    portfolio.register_user("123", "TestPlayer")
+
+    # Simulate a purchase on November 14.
+    portfolio.buy_stock(
+        "123",
+        "AAPL",
+        Decimal("2"),
+        Decimal("100"),
+        "2026-11-14"
+    )
+
+    # Mock the historical price lookup.
+    def mock_historical_price(symbol, target_date):
+        return {
+            "symbol": symbol,
+            "price_date": "2026-11-13",
+            "price": Decimal("110")
+        }
+
+    monkeypatch.setattr(
+        portfolio,
+        "get_price_on_or_before",
+        mock_historical_price
+    )
+
+    # Value the portfolio as of November 13.
+    earlier = portfolio.get_historical_valued_portfolio(
+        "123",
+        "2026-11-13"
+    )
+
+    assert earlier["cash_balance"] == Decimal("100000")
+    assert earlier["holdings"] == {}
+    assert earlier["total_value"] == Decimal("100000")
+
+    # Value the portfolio as of November 14.
+    later = portfolio.get_historical_valued_portfolio(
+        "123",
+        "2026-11-14"
+    )
+
+    assert later["cash_balance"] == Decimal("99799.80")
+    assert later["holdings"]["AAPL"]["quantity"] == Decimal("2")
+    assert later["holdings"]["AAPL"]["price"] == Decimal("110")
+    assert later["holdings_value"] == Decimal("220")
+    assert later["total_value"] == Decimal("100019.80")
+
+def test_historical_valuation_after_sale(setup_database, monkeypatch):
+    """
+    Verify that historical valuation correctly accounts
+    for purchases and sales.
+    """
+
+    portfolio.register_user("123", "TestPlayer")
+
+    # Purchase 4 shares at $100 each.
+    portfolio.buy_stock(
+        "123",
+        "AAPL",
+        Decimal("4"),
+        Decimal("100"),
+        "2026-11-13"
+    )
+
+    # Sell 1 share at $120.
+    portfolio.sell_stock(
+        "123",
+        "AAPL",
+        Decimal("1"),
+        Decimal("120"),
+        "2026-11-14"
+    )
+
+    # Mock the historical price lookup.
+    def mock_historical_price(symbol, target_date):
+        prices = {
+            "2026-11-13": Decimal("110"),
+            "2026-11-14": Decimal("125")
+        }
+
+        return {
+            "symbol": symbol,
+            "price_date": target_date,
+            "price": prices[target_date]
+        }
+
+    monkeypatch.setattr(
+        portfolio,
+        "get_price_on_or_before",
+        mock_historical_price
+    )
+
+    # Before the sale: all 4 shares should be held.
+    before_sale = portfolio.get_historical_valued_portfolio(
+        "123",
+        "2026-11-13"
+    )
+
+    assert before_sale["holdings"]["AAPL"]["quantity"] == Decimal("4")
+    assert before_sale["cash_balance"] == Decimal("99599.60")
+    assert before_sale["total_value"] == Decimal("100039.60")
+
+    # After the sale: only 3 shares should remain.
+    after_sale = portfolio.get_historical_valued_portfolio(
+        "123",
+        "2026-11-14"
+    )
+
+    assert after_sale["holdings"]["AAPL"]["quantity"] == Decimal("3")
+    assert after_sale["cash_balance"] == Decimal("99719.48")
+    assert after_sale["holdings_value"] == Decimal("375")
+    assert after_sale["total_value"] == Decimal("100094.48")
+
+
+def test_historical_valuation_multiple_stocks(setup_database, monkeypatch):
+    """
+    Verify that multiple stocks are independently valued
+    using their respective historical prices.
+    """
+
+    portfolio.register_user("123", "TestPlayer")
+
+    portfolio.buy_stock(
+        "123",
+        "AAPL",
+        Decimal("2"),
+        Decimal("100"),
+        "2026-11-13"
+    )
+
+    portfolio.buy_stock(
+        "123",
+        "MSFT",
+        Decimal("3"),
+        Decimal("200"),
+        "2026-11-13"
+    )
+
+    # Provide different historical prices for each stock.
+    def mock_historical_price(symbol, target_date):
+        prices = {
+            "AAPL": Decimal("110"),
+            "MSFT": Decimal("190")
+        }
+
+        return {
+            "symbol": symbol,
+            "price_date": target_date,
+            "price": prices[symbol]
+        }
+
+    monkeypatch.setattr(
+        portfolio,
+        "get_price_on_or_before",
+        mock_historical_price
+    )
+
+    result = portfolio.get_historical_valued_portfolio(
+        "123",
+        "2026-11-13"
+    )
+
+    assert result["holdings"]["AAPL"]["market_value"] == Decimal("220")
+    assert result["holdings"]["MSFT"]["market_value"] == Decimal("570")
+
+    assert result["holdings_value"] == Decimal("790")
+    assert result["cash_balance"] == Decimal("99199.20")
+    assert result["total_value"] == Decimal("99989.20")

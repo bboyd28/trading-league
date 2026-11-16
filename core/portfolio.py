@@ -1,7 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 
 from core.database import get_connection
-from core.prices import get_latest_price
+from core.prices import get_latest_price, get_price_on_or_before
 
 
 def register_user(discord_id: str, username: str):
@@ -389,6 +389,109 @@ def get_valued_portfolio(discord_id: str):
         "total_value": total_value
     }
 
+
+def get_historical_valued_portfolio(
+    discord_id: str,
+    target_date: str
+):
+    """
+    Reconstruct and value a user's portfolio
+    as of a specified historical date.
+    """
+
+    with get_connection() as connection:
+
+        # Retrieve the user.
+        user = connection.execute("""
+            SELECT discord_id, username
+            FROM users
+            WHERE discord_id = ?
+        """, (discord_id,)).fetchone()
+
+        if user is None:
+            raise ValueError("User does not exist.")
+
+        # Retrieve the original starting balance.
+        settings = connection.execute("""
+            SELECT starting_balance_cents
+            FROM league_settings
+            WHERE setting_id = 1
+        """).fetchone()
+
+        if settings is None:
+            raise RuntimeError("League settings have not been initialized.")
+
+        cash_balance = Decimal(
+            settings["starting_balance_cents"]
+        ) / 100
+
+        # Retrieve all trades occurring on or before the target date.
+        trades = connection.execute("""
+            SELECT symbol, side, quantity,
+                   gross_amount_cents, fee_cents
+            FROM trades
+            WHERE discord_id = ?
+            AND price_date <= ?
+            ORDER BY price_date ASC, trade_id ASC
+        """, (discord_id, target_date)).fetchall()
+
+    # Reconstruct historical cash and holdings.
+    holdings = {}
+
+    for trade in trades:
+
+        symbol = trade["symbol"]
+        quantity = Decimal(trade["quantity"])
+
+        gross_amount = Decimal(trade["gross_amount_cents"]) / 100
+        fee = Decimal(trade["fee_cents"]) / 100
+
+        if symbol not in holdings:
+            holdings[symbol] = Decimal("0")
+
+        if trade["side"] == "BUY":
+            holdings[symbol] += quantity
+            cash_balance -= gross_amount + fee
+
+        else:
+            holdings[symbol] -= quantity
+            cash_balance += gross_amount - fee
+
+    # Calculate the historical market value of each holding.
+    valued_holdings = {}
+    holdings_value = Decimal("0")
+
+    for symbol, quantity in holdings.items():
+
+        if quantity <= 0:
+            continue
+
+        price_data = get_price_on_or_before(symbol, target_date)
+
+        market_value = quantity * price_data["price"]
+
+        valued_holdings[symbol] = {
+            "quantity": quantity,
+            "price": price_data["price"],
+            "price_date": price_data["price_date"],
+            "market_value": market_value
+        }
+
+        holdings_value += market_value
+
+    total_value = cash_balance + holdings_value
+
+    return {
+        "discord_id": user["discord_id"],
+        "username": user["username"],
+        "snapshot_date": target_date,
+        "cash_balance": cash_balance,
+        "holdings": valued_holdings,
+        "holdings_value": holdings_value,
+        "total_value": total_value
+    }
+
+
 def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
     """
     Save a daily snapshot of a user's portfolio.
@@ -397,7 +500,9 @@ def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
     """
 
     # Retrieve the user's current portfolio valuation.
-    portfolio = get_valued_portfolio(discord_id)
+    portfolio = get_historical_valued_portfolio(
+        discord_id,
+        snapshot_date)
 
     # Convert dollar values into integer cents.
     cash_cents = int(
@@ -429,10 +534,7 @@ def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
             VALUES (?, ?, ?, ?, ?)
 
             ON CONFLICT(discord_id, snapshot_date)
-            DO UPDATE SET
-                cash_balance_cents = excluded.cash_balance_cents,
-                holdings_value_cents = excluded.holdings_value_cents,
-                total_value_cents = excluded.total_value_cents
+            DO NOTHING
         """, (
             discord_id,
             snapshot_date,
@@ -440,14 +542,20 @@ def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
             holdings_cents,
             total_cents
         ))
-
+        saved_snapshot = connection.execute("""
+            SELECT *
+            FROM portfolio_snapshots
+            WHERE discord_id = ?
+            AND snapshot_date = ?
+        """, (discord_id, snapshot_date)).fetchone()
     return {
-        "discord_id": discord_id,
-        "snapshot_date": snapshot_date,
-        "cash_balance": Decimal(cash_cents) / 100,
-        "holdings_value": Decimal(holdings_cents) / 100,
-        "total_value": Decimal(total_cents) / 100
+        "discord_id": saved_snapshot["discord_id"],
+        "snapshot_date": saved_snapshot["snapshot_date"],
+        "cash_balance": Decimal(saved_snapshot["cash_balance_cents"]) / 100,
+        "holdings_value": Decimal(saved_snapshot["holdings_value_cents"]) / 100,
+        "total_value": Decimal(saved_snapshot["total_value_cents"]) / 100
     }
+    
 
 def get_active_symbols():
     """
@@ -508,3 +616,4 @@ def get_active_users():
         """).fetchall()
 
         return [user["discord_id"] for user in users]
+
