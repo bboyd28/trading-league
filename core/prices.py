@@ -99,6 +99,42 @@ def get_latest_price(symbol: str) -> Decimal:
 
         return Decimal(price["close_price"])
 
+
+def get_price_on_or_before(symbol: str, target_date: str):
+    """
+    Retrieve the most recent closing price on or before a specified date.
+    Returns both the price and the actual price date.
+    """
+
+    symbol = symbol.upper().strip()
+
+    if not symbol:
+        raise ValueError("Stock symbol is required.")
+
+    with get_connection() as connection:
+        price = connection.execute("""
+            SELECT price_date, close_price
+            FROM price_history
+            WHERE symbol = ?
+            AND price_date <= ?
+            ORDER BY price_date DESC
+            LIMIT 1
+        """, (symbol, target_date)).fetchone()
+
+        if price is None:
+            raise ValueError(
+                f"No price history found for {symbol} "
+                f"on or before {target_date}."
+            )
+
+        return {
+            "symbol": symbol,
+            "price_date": price["price_date"],
+            "price": Decimal(price["close_price"])
+        }
+        
+
+
 def get_historical_prices(
     symbol: str,
     start_date: str,
