@@ -24,7 +24,7 @@ def fetch_daily_prices(symbol: str, period: str = "1mo") -> pd.DataFrame:
     )
 
     if prices.empty:
-        raise ValueError("No price data found for {symbol}.")
+        raise ValueError(f"No price data found for {symbol}.")
     required_columns = {"Close", "Adj Close"}
     if not required_columns.issubset(prices.columns):
         raise RuntimeError("Expected price columns were not returned.")
@@ -203,3 +203,24 @@ def update_stock_prices(
     store_price_history(symbol, prices)
 
     return len(prices)
+
+def get_or_update_price(symbol: str, target_date: str):
+    """
+    Retrieve a stored price, automatically downloading price history
+    if the stock has not been initialized yet.
+    """
+
+    symbol = symbol.upper().strip()
+
+    if not symbol:
+        raise ValueError("Stock symbol is required.")
+
+    try:
+        return get_price_on_or_before(symbol, target_date)
+
+    except ValueError:
+        # No stored price history exists, so initialize this stock.
+        update_stock_prices(symbol, period="5d")
+
+        # Retrieve the newly stored price.
+        return get_price_on_or_before(symbol, target_date)
