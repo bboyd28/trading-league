@@ -517,3 +517,66 @@ def test_historical_valuation_multiple_stocks(setup_database, monkeypatch):
     assert result["holdings_value"] == Decimal("790")
     assert result["cash_balance"] == Decimal("99199.20")
     assert result["total_value"] == Decimal("99989.20")
+
+def test_recalculate_portfolio_snapshot(setup_database, monkeypatch):
+    """
+    Verify that an existing snapshot can be intentionally recalculated.
+    """
+
+    portfolio.register_user("123", "TestPlayer")
+
+    portfolio.buy_stock(
+        "123",
+        "AAPL",
+        Decimal("2"),
+        Decimal("100"),
+        "2026-11-14"
+    )
+
+    # Initial historical price: $110.
+    monkeypatch.setattr(
+        portfolio,
+        "get_price_on_or_before",
+        lambda symbol, target_date: {
+            "symbol": symbol,
+            "price_date": "2026-11-13",
+            "price": Decimal("110")
+        }
+    )
+
+    portfolio.save_portfolio_snapshot("123", "2026-11-14")
+
+    # Corrected historical price: $120.
+    monkeypatch.setattr(
+        portfolio,
+        "get_price_on_or_before",
+        lambda symbol, target_date: {
+            "symbol": symbol,
+            "price_date": "2026-11-13",
+            "price": Decimal("120")
+        }
+    )
+
+    result = portfolio.recalculate_portfolio_snapshot(
+        "123",
+        "2026-11-14"
+    )
+
+    assert result["holdings_value"] == Decimal("240")
+    assert result["total_value"] == Decimal("100039.80")
+
+def test_recalculate_nonexistent_snapshot(setup_database):
+    """
+    Verify that recalculation fails when no snapshot exists.
+    """
+
+    portfolio.register_user("123", "TestPlayer")
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot recalculate a snapshot that does not exist."
+    ):
+        portfolio.recalculate_portfolio_snapshot(
+            "123",
+            "2026-11-14"
+        )

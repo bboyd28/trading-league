@@ -555,7 +555,81 @@ def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
         "holdings_value": Decimal(saved_snapshot["holdings_value_cents"]) / 100,
         "total_value": Decimal(saved_snapshot["total_value_cents"]) / 100
     }
-    
+
+def recalculate_portfolio_snapshot(
+    discord_id: str,
+    snapshot_date: str
+):
+    """
+    Intentionally recalculate an existing historical snapshot.
+
+    Does not create a snapshot if one does not already exist.
+    """
+
+    # Confirm that a snapshot already exists.
+    with get_connection() as connection:
+
+        existing_snapshot = connection.execute("""
+            SELECT 1
+            FROM portfolio_snapshots
+            WHERE discord_id = ?
+            AND snapshot_date = ?
+        """, (discord_id, snapshot_date)).fetchone()
+
+        if existing_snapshot is None:
+            raise ValueError(
+                "Cannot recalculate a snapshot that does not exist."
+            )
+
+    # Reconstruct the portfolio's value on that date.
+    portfolio = get_historical_valued_portfolio(
+        discord_id,
+        snapshot_date
+    )
+
+    # Convert dollar values into integer cents.
+    cash_cents = int(
+        (portfolio["cash_balance"] * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+    holdings_cents = int(
+        (portfolio["holdings_value"] * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+    total_cents = cash_cents + holdings_cents
+
+    # Intentionally replace the existing snapshot.
+    with get_connection() as connection:
+
+        connection.execute("""
+            UPDATE portfolio_snapshots
+            SET
+                cash_balance_cents = ?,
+                holdings_value_cents = ?,
+                total_value_cents = ?
+            WHERE discord_id = ?
+            AND snapshot_date = ?
+        """, (
+            cash_cents,
+            holdings_cents,
+            total_cents,
+            discord_id,
+            snapshot_date
+        ))
+
+    return {
+        "discord_id": discord_id,
+        "snapshot_date": snapshot_date,
+        "cash_balance": Decimal(cash_cents) / 100,
+        "holdings_value": Decimal(holdings_cents) / 100,
+        "total_value": Decimal(total_cents) / 100
+    }
 
 def get_active_symbols():
     """
