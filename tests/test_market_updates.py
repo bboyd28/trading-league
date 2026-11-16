@@ -22,7 +22,8 @@ def test_update_league_prices(setup_database, monkeypatch):
     assert results == {
         "updated": {
             "AAPL": 23,
-            "MSFT": 23
+            "MSFT": 23,
+            "SPY": 23
         },
         "failed": {}
     }
@@ -49,7 +50,8 @@ def test_update_league_prices_handles_failure(setup_database, monkeypatch):
 
     results = market_updates.update_league_prices()
 
-    assert results["updated"] == {"AAPL": 23}
+    assert results["updated"] == {"AAPL": 23,
+                                  "SPY": 23}
 
     assert results["failed"] == {
         "INVALID": "No price data found."
@@ -150,3 +152,28 @@ def test_run_daily_market_update_handles_snapshot_failure(
 
     assert results["skipped"] is False
 
+def test_spy_updates_without_participants(setup_database, monkeypatch):
+
+    updated_symbols = []
+
+    def fake_update_stock_prices(symbol):
+        updated_symbols.append(symbol)
+        return 20
+
+    monkeypatch.setattr(
+        market_updates,
+        "get_active_symbols",
+        lambda: []
+    )
+
+    monkeypatch.setattr(
+        market_updates,
+        "update_stock_prices",
+        fake_update_stock_prices
+    )
+
+    result = market_updates.update_league_prices()
+
+    assert updated_symbols == ["SPY"]
+    assert result["updated"] == {"SPY": 20}
+    assert result["failed"] == {}

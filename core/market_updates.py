@@ -15,6 +15,7 @@ def update_league_prices():
     """
 
     symbols = get_active_symbols()
+    symbols = sorted(set(symbols) | {"SPY"})
 
     results = {
         "updated": {},
