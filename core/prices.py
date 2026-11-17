@@ -1,226 +1,176 @@
-import yfinance as yf
-import pandas as pd
+"""Daily price download (Yahoo Finance) and stored price lookups.
 
+fetch_daily_prices is the only function that talks to Yahoo. To switch to
+another data source later, replace that one function.
+"""
+import logging
+import re
+import time
 from decimal import Decimal
+
+import pandas as pd
+import yfinance as yf
+
 from core.database import get_connection
+from core.market_calendar import last_completed_session
 
-def fetch_daily_prices(symbol: str, period: str = "1mo") -> pd.DataFrame:
-    """
-    Retrieve historical daily stock prices from Yahoo Finance.
-    Returns closing and adjusted closing prices.
-    """
+logger = logging.getLogger(__name__)
 
-    symbol = symbol.upper().strip()
+SYMBOL_PATTERN = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+PRICE_PLACES = Decimal("0.0001")
+REFRESH_COOLDOWN_SECONDS = 300
 
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
+_last_refresh = {}
 
-    ticker = yf.Ticker(symbol)
-    prices = ticker.history(
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        actions=False
-    )
+
+def normalize_symbol(symbol):
+    cleaned = str(symbol).upper().strip()
+
+    if not SYMBOL_PATTERN.match(cleaned):
+        raise ValueError(f"'{symbol}' is not a valid stock symbol.")
+
+    return cleaned
+
+
+def fetch_daily_prices(symbol, period="1mo", now=None):
+    """Download daily closes, leaving out any session that isn't final yet."""
+    symbol = normalize_symbol(symbol)
+
+    try:
+        prices = yf.Ticker(symbol).history(
+            period=period, interval="1d", auto_adjust=False, actions=False
+        )
+    except Exception as error:
+        raise RuntimeError(f"Could not reach the price provider: {error}") from error
 
     if prices.empty:
         raise ValueError(f"No price data found for {symbol}.")
-    required_columns = {"Close", "Adj Close"}
-    if not required_columns.issubset(prices.columns):
+
+    if not {"Close", "Adj Close"}.issubset(prices.columns):
         raise RuntimeError("Expected price columns were not returned.")
 
-    return prices[["Close", "Adj Close"]].copy()
+    prices = prices[["Close", "Adj Close"]].dropna(subset=["Close"])
 
-def store_price_history(symbol: str, prices: pd.DataFrame):
-    """
-    Store daily closing and adjusted closing prices in the database
-    """
+    # While the market is open Yahoo includes today's unfinished bar.
+    cutoff = last_completed_session(now)
+    prices = prices[[stamp.date() <= cutoff for stamp in prices.index]]
 
-    symbol = symbol.upper().strip()
+    if prices.empty:
+        raise ValueError(f"No completed daily prices found for {symbol}.")
 
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    with get_connection() as connection:
-        for date, row in prices.iterrows():
-            price_date = date.strftime("%Y-%m-%d")
-
-            close_price = str(Decimal(str(row["Close"])))
-            adjusted_close = str(Decimal(str(row["Adj Close"])))
-
-            connection.execute("""
-                INSERT INTO price_history (
-                    symbol,
-                    price_date,
-                    close_price,
-                    adjusted_close,
-                    source
-                )
-                VALUES (?, ?, ?, ?, 'yfinance')
-                
-                ON CONFLICT(symbol, price_date)
-                DO UPDATE SET
-                    close_price = excluded.close_price,
-                    adjusted_close = excluded.adjusted_close,
-                    source = excluded.source,
-                    fetched_at = strftime(
-                        '%Y-%m-%dT%H:%M:%fZ',
-                        'now'
-                    )
-                """, (
-                    symbol,
-                    price_date,
-                    close_price,
-                    adjusted_close
-                ))
-
-def get_latest_price(symbol: str) -> Decimal:
-    """
-    Retrieve the most recent stored closing price for a stock.
-    """
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    with get_connection() as connection:
-
-        price = connection.execute("""
-            SELECT close_price
-            FROM price_history
-            WHERE symbol = ?
-            ORDER BY price_date DESC
-            LIMIT 1
-        """, (symbol,)).fetchone()
-
-        if price is None:
-            raise ValueError(f"No price history found for {symbol}.")
-
-        return Decimal(price["close_price"])
+    return prices.copy()
 
 
-def get_price_on_or_before(symbol: str, target_date: str):
-    """
-    Retrieve the most recent closing price on or before a specified date.
-    Returns both the price and the actual price date.
-    """
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    with get_connection() as connection:
-        price = connection.execute("""
-            SELECT price_date, close_price
-            FROM price_history
-            WHERE symbol = ?
-            AND price_date <= ?
-            ORDER BY price_date DESC
-            LIMIT 1
-        """, (symbol, target_date)).fetchone()
-
-        if price is None:
-            raise ValueError(
-                f"No price history found for {symbol} "
-                f"on or before {target_date}."
-            )
-
-        return {
-            "symbol": symbol,
-            "price_date": price["price_date"],
-            "price": Decimal(price["close_price"])
-        }
-        
+def _to_price_text(value):
+    return str(Decimal(str(value)).quantize(PRICE_PLACES))
 
 
-def get_historical_prices(
-    symbol: str,
-    start_date: str,
-    end_date: str
-) -> pd.DataFrame:
-    """
-    Retrieve historical daily prices for a stock
-    within a specified date range.
-    """
+def store_price_history(symbol, prices):
+    symbol = normalize_symbol(symbol)
 
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    with get_connection() as connection:
-
-        prices = connection.execute("""
-            SELECT
-                price_date,
-                close_price,
-                adjusted_close
-            FROM price_history
-            WHERE symbol = ?
-            AND price_date >= ?
-            AND price_date <= ?
-            ORDER BY price_date ASC
-        """, (symbol, start_date, end_date)).fetchall()
-
-        if not prices:
-            raise ValueError(
-                f"No price history found for {symbol} "
-                f"within the specified date range."
-            )
-
-        data = pd.DataFrame(
-            [dict(row) for row in prices]
+    rows = [
+        (
+            symbol,
+            stamp.strftime("%Y-%m-%d"),
+            _to_price_text(row["Close"]),
+            None if pd.isna(row["Adj Close"]) else _to_price_text(row["Adj Close"]),
         )
+        for stamp, row in prices.iterrows()
+    ]
 
-        data["close_price"] = data["close_price"].apply(Decimal)
-        data["adjusted_close"] = data["adjusted_close"].apply(Decimal)
+    with get_connection(write=True) as connection:
+        connection.executemany("""
+            INSERT INTO price_history (symbol, price_date, close_price, adjusted_close, source)
+            VALUES (?, ?, ?, ?, 'yfinance')
+            ON CONFLICT(symbol, price_date) DO UPDATE SET
+                close_price = excluded.close_price,
+                adjusted_close = excluded.adjusted_close,
+                source = excluded.source,
+                fetched_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        """, rows)
 
-        data.set_index("price_date", inplace=True)
 
-        return data
-
-def update_stock_prices(
-    symbol: str,
-    period: str = "1mo"
-) -> int:
-    """
-    Retrieve recent daily prices and update the database.
-
-    Returns the number of observations retrieved.
-    """
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    # Retrieve recent daily prices.
+def update_stock_prices(symbol, period="1mo"):
+    """Download recent prices and store them. Returns the number of days."""
+    symbol = normalize_symbol(symbol)
     prices = fetch_daily_prices(symbol, period)
-
-    # Store the retrieved observations.
     store_price_history(symbol, prices)
-
     return len(prices)
 
-def get_or_update_price(symbol: str, target_date: str):
-    """
-    Retrieve a stored price, automatically downloading price history
-    if the stock has not been initialized yet.
-    """
 
-    symbol = symbol.upper().strip()
+def get_prices_on_or_before(symbols, target_date):
+    """Latest stored close on or before target_date, for several symbols.
 
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
+    Returns {symbol: {"symbol", "price_date", "price"}}.
+    """
+    found = {}
+
+    with get_connection() as connection:
+        for symbol in symbols:
+            symbol = normalize_symbol(symbol)
+            row = connection.execute("""
+                SELECT price_date, close_price
+                FROM price_history
+                WHERE symbol = ? AND price_date <= ?
+                ORDER BY price_date DESC
+                LIMIT 1
+            """, (symbol, target_date)).fetchone()
+
+            if row is None:
+                raise ValueError(
+                    f"No price history found for {symbol} on or before {target_date}."
+                )
+
+            found[symbol] = {
+                "symbol": symbol,
+                "price_date": row["price_date"],
+                "price": Decimal(row["close_price"]),
+            }
+
+    return found
+
+
+def get_price_on_or_before(symbol, target_date):
+    symbol = normalize_symbol(symbol)
+    return get_prices_on_or_before([symbol], target_date)[symbol]
+
+
+def get_latest_prices(symbols):
+    return get_prices_on_or_before(symbols, "9999-12-31")
+
+
+def _refresh_symbol(symbol):
+    """Download fresh prices, but not more than once per cooldown per symbol."""
+    elapsed = time.monotonic() - _last_refresh.get(symbol, float("-inf"))
+
+    if elapsed < REFRESH_COOLDOWN_SECONDS:
+        return
+
+    _last_refresh[symbol] = time.monotonic()
+    update_stock_prices(symbol)
+
+
+def get_execution_price(symbol, now=None):
+    """Official close of the last completed session, downloading it if needed.
+
+    Raises if that close isn't available yet, so nobody trades on a stale price.
+    """
+    symbol = normalize_symbol(symbol)
+    session = last_completed_session(now).isoformat()
 
     try:
-        return get_price_on_or_before(symbol, target_date)
-
+        latest = get_price_on_or_before(symbol, session)
     except ValueError:
-        # No stored price history exists, so initialize this stock.
-        update_stock_prices(symbol, period="5d")
+        latest = None
 
-        # Retrieve the newly stored price.
-        return get_price_on_or_before(symbol, target_date)
+    if latest is None or latest["price_date"] < session:
+        _refresh_symbol(symbol)
+        latest = get_price_on_or_before(symbol, session)
+
+    if latest["price_date"] < session:
+        raise ValueError(
+            f"The {session} close for {symbol} isn't available yet "
+            f"(latest is {latest['price_date']}). Try again in a few minutes."
+        )
+
+    return latest

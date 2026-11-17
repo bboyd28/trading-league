@@ -1,789 +1,485 @@
-from decimal import Decimal, ROUND_HALF_UP
+"""Accounts, trades, and portfolio valuation.
 
-from core.database import get_connection
-from core.prices import get_latest_price, get_price_on_or_before
+Money is stored as integer cents. Share quantities are stored as decimal
+text with 8 places. The trades table is the ledger: holdings and cash can
+always be rebuilt from it (see find_cash_mismatches).
+"""
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+
+from core.database import get_connection, get_league_settings
+from core.prices import (
+    get_latest_prices,
+    get_prices_on_or_before,
+    normalize_symbol,
+)
+
+QUANTITY_PLACES = Decimal("0.00000001")
+MIN_BUY_CENTS = 100
 
 
-def register_user(discord_id: str, username: str):
+# ---- small helpers -------------------------------------------------------
+
+def to_decimal(value, name="Value"):
+    """Parse user input into a finite Decimal, or raise ValueError."""
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        raise ValueError(f"{name} must be a number.") from None
+
+    if not number.is_finite():
+        raise ValueError(f"{name} must be a number.")
+
+    return number
+
+
+def to_cents(amount):
+    return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _fee_cents(gross_cents, fee_rate_bps):
+    fee = Decimal(gross_cents) * fee_rate_bps / 10_000
+    return int(fee.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _to_quantity(value, name="Quantity"):
+    quantity = to_decimal(value, name).quantize(QUANTITY_PLACES, rounding=ROUND_DOWN)
+
+    if quantity <= 0:
+        raise ValueError(f"{name} must be greater than zero.")
+
+    return quantity
+
+
+def _to_price(value):
+    price = to_decimal(value, "Price")
+
+    if price <= 0:
+        raise ValueError("Price must be greater than zero.")
+
+    return price
+
+
+def _text(number):
+    return format(number.normalize(), "f")
+
+
+def _active_user(connection, discord_id):
+    user = connection.execute("""
+        SELECT cash_balance_cents FROM users
+        WHERE discord_id = ? AND is_active = 1
+    """, (discord_id,)).fetchone()
+
+    if user is None:
+        raise ValueError("User does not exist or is inactive.")
+
+    return user
+
+
+def _replay(connection, discord_id, as_of=None):
+    """Replay a user's trades. Returns (net cash change in cents, holdings)."""
+    query = """
+        SELECT symbol, side, quantity, gross_amount_cents, fee_cents
+        FROM trades WHERE discord_id = ?
     """
-    Register a new league participant.
+    params = [discord_id]
 
-    Existing users keep their current balance.
-    Only their username is updated if they register again.
-    """
+    if as_of is not None:
+        query += " AND price_date <= ?"
+        params.append(as_of)
 
+    cash_change = 0
+    holdings = {}
+
+    for trade in connection.execute(query + " ORDER BY trade_id", params):
+        quantity = Decimal(trade["quantity"])
+
+        if trade["side"] == "BUY":
+            cash_change -= trade["gross_amount_cents"] + trade["fee_cents"]
+        else:
+            cash_change += trade["gross_amount_cents"] - trade["fee_cents"]
+            quantity = -quantity
+
+        holdings[trade["symbol"]] = holdings.get(trade["symbol"], Decimal(0)) + quantity
+
+    holdings = {s: q for s, q in holdings.items() if q > 0}
+    return cash_change, holdings
+
+
+def _insert_trade(connection, discord_id, symbol, side, quantity, price,
+                  gross_cents, fee_cents, price_date):
+    connection.execute("""
+        INSERT INTO trades (
+            discord_id, symbol, side, quantity, price_per_share,
+            gross_amount_cents, fee_cents, price_date
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (discord_id, symbol, side, _text(quantity), _text(price),
+          gross_cents, fee_cents, price_date))
+
+
+# ---- accounts ------------------------------------------------------------
+
+def register_user(discord_id, username):
+    """Create a league account. Re-registering only updates the username."""
     if not discord_id or not username:
         raise ValueError("Discord ID and username are required.")
 
-    with get_connection() as connection:
+    with get_connection(write=True) as connection:
+        starting_balance = get_league_settings(connection)["starting_balance_cents"]
 
-        settings = connection.execute("""
-            SELECT starting_balance_cents
-            FROM league_settings
-            WHERE setting_id = 1
-        """).fetchone()
-
-        if settings is None:
-            raise RuntimeError("League settings have not been initialized.")
-
-        starting_balance = settings["starting_balance_cents"]
-
+        is_new = connection.execute(
+            "SELECT 1 FROM users WHERE discord_id = ?", (discord_id,)
+        ).fetchone() is None
 
         connection.execute("""
             INSERT INTO users (
-                discord_id,
-                username,
-                cash_balance_cents
+                discord_id, username, cash_balance_cents, starting_balance_cents
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET username = excluded.username
+        """, (discord_id, username, starting_balance, starting_balance))
 
-            ON CONFLICT(discord_id)
-            DO UPDATE SET username = excluded.username
-        """, (discord_id, username, starting_balance))
+        user = connection.execute(
+            "SELECT * FROM users WHERE discord_id = ?", (discord_id,)
+        ).fetchone()
 
-
-        user = connection.execute("""
-            SELECT *
-            FROM users
-            WHERE discord_id = ?
-        """, (discord_id,)).fetchone()
-
-        return dict(user)
+    return {**dict(user), "is_new": is_new}
 
 
-def buy_stock(
-    discord_id: str,
-    symbol: str,
-    quantity: Decimal,
-    price_per_share: Decimal,
-    price_date: str
-):
-    """
-    Purchase fractional shares of a stock.
-
-    Deducts the purchase amount and transaction fee
-    from the user's cash balance.
-    """
-
-    quantity = Decimal(str(quantity))
-    price_per_share = Decimal(str(price_per_share))
-
-    if quantity <= 0:
-        raise ValueError("Quantity must be greater than zero.")
-
-    if price_per_share <= 0:
-        raise ValueError("Price must be greater than zero.")
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    # Calculate the gross purchase amount.
-    gross_amount = quantity * price_per_share
-
-    gross_cents = int(
-        (gross_amount * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
+def get_active_users():
     with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT discord_id FROM users WHERE is_active = 1 ORDER BY discord_id"
+        ).fetchall()
 
-        # Retrieve the user's cash balance.
-        user = connection.execute("""
-            SELECT cash_balance_cents
-            FROM users
-            WHERE discord_id = ?
-            AND is_active = 1
-        """, (discord_id,)).fetchone()
+    return [row["discord_id"] for row in rows]
 
-        if user is None:
-            raise ValueError("User does not exist or is inactive.")
 
-        # Retrieve the league's transaction fee.
-        settings = connection.execute("""
-            SELECT fee_rate_bps
-            FROM league_settings
-            WHERE setting_id = 1
-        """).fetchone()
+# ---- trading -------------------------------------------------------------
 
-        if settings is None:
-            raise RuntimeError("League settings have not been initialized.")
+def buy_stock(discord_id, symbol, quantity, price_per_share, price_date):
+    """Buy (fractional) shares. Cash drops by the cost plus the fee."""
+    symbol = normalize_symbol(symbol)
+    quantity = _to_quantity(quantity)
+    price = _to_price(price_per_share)
 
-        fee_rate = Decimal(settings["fee_rate_bps"]) / Decimal("10000")
+    gross_cents = to_cents(quantity * price)
 
-        fee_cents = int(
-            (Decimal(gross_cents) * fee_rate).quantize(
-                Decimal("1"),
-                rounding=ROUND_HALF_UP
-            )
+    if gross_cents < MIN_BUY_CENTS:
+        raise ValueError("Minimum purchase is $1.00.")
+
+    with get_connection(write=True) as connection:
+        cash = _active_user(connection, discord_id)["cash_balance_cents"]
+        fee_cents = _fee_cents(
+            gross_cents, get_league_settings(connection)["fee_rate_bps"]
         )
-
         total_cost = gross_cents + fee_cents
 
-        # Prevent purchases that exceed available cash.
-        if total_cost > user["cash_balance_cents"]:
+        if total_cost > cash:
             raise ValueError("Insufficient funds.")
 
-        # Deduct the purchase amount and fee.
         connection.execute("""
-            UPDATE users
-            SET cash_balance_cents = cash_balance_cents - ?
+            UPDATE users SET cash_balance_cents = cash_balance_cents - ?
             WHERE discord_id = ?
         """, (total_cost, discord_id))
 
-        # Record the completed purchase.
-        connection.execute("""
-            INSERT INTO trades (
-                discord_id,
-                symbol,
-                side,
-                quantity,
-                price_per_share,
-                gross_amount_cents,
-                fee_cents,
-                price_date
-            )
-            VALUES (?, ?, 'BUY', ?, ?, ?, ?, ?)
-        """, (
-            discord_id,
-            symbol,
-            str(quantity),
-            str(price_per_share),
-            gross_cents,
-            fee_cents,
-            price_date
-        ))
+        _insert_trade(connection, discord_id, symbol, "BUY", quantity, price,
+                      gross_cents, fee_cents, price_date)
 
     return {
         "symbol": symbol,
         "quantity": quantity,
-        "price_per_share": price_per_share,
+        "price_per_share": price,
         "gross_amount_cents": gross_cents,
         "fee_cents": fee_cents,
-        "total_cost_cents": total_cost
+        "total_cost_cents": total_cost,
     }
 
-def buy_stock_by_amount(
-    discord_id: str,
-    symbol: str,
-    dollar_amount: Decimal,
-    price_per_share: Decimal,
-    price_date: str
-):
-    """
-    Purchase as many fractional shares as possible
-    using a specified dollar amount before transaction fees.
-    """
 
-    dollar_amount = Decimal(str(dollar_amount))
-    price_per_share = Decimal(str(price_per_share))
+def buy_stock_by_amount(discord_id, symbol, dollar_amount, price_per_share, price_date):
+    """Buy as many shares as the amount covers. The fee is charged on top."""
+    amount = to_decimal(dollar_amount, "Dollar amount")
+    price = _to_price(price_per_share)
 
-    if dollar_amount <= 0:
+    if amount <= 0:
         raise ValueError("Dollar amount must be greater than zero.")
 
-    if price_per_share <= 0:
-        raise ValueError("Price must be greater than zero.")
-
-    quantity = dollar_amount / price_per_share
-
-    result = buy_stock(
-        discord_id,
-        symbol,
-        quantity,
-        price_per_share,
-        price_date
-    )
-
-    return result
+    quantity = (amount / price).quantize(QUANTITY_PLACES, rounding=ROUND_DOWN)
+    return buy_stock(discord_id, symbol, quantity, price, price_date)
 
 
+def _sell(discord_id, symbol, quantity, dollar_amount, price_per_share, price_date):
+    symbol = normalize_symbol(symbol)
+    price = _to_price(price_per_share)
 
+    if dollar_amount is not None:
+        amount = to_decimal(dollar_amount, "Sale amount")
 
+        if amount <= 0:
+            raise ValueError("Sale amount must be greater than zero.")
 
-def sell_stock(
-    discord_id: str,
-    symbol: str,
-    quantity: Decimal,
-    price_per_share: Decimal,
-    price_date: str
-):
-    """
-    Sell fractional shares of a stock.
-
-    Adds the sale proceeds, minus transaction fees,
-    to the user's cash balance.
-    """
-
-
-    if str(quantity).strip().lower() == "all":
-        quantity = None
-    else:
-        quantity = Decimal(str(quantity))
-
-    price_per_share = Decimal(str(price_per_share))
-
-    if quantity is not None and quantity <= 0:
-        raise ValueError("Quantity must be greater than zero.")
-
-    if price_per_share <= 0:
-        raise ValueError("Price must be greater than zero.")
-
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is required.")
-
-    with get_connection() as connection:
-
-        user = connection.execute("""
-            SELECT cash_balance_cents
-            FROM users
-            WHERE discord_id = ?
-            AND is_active = 1
-        """, (discord_id,)).fetchone()
-
-        if user is None:
-            raise ValueError("User does not exist or is inactive.")
-
-        trades = connection.execute("""
-            SELECT side, quantity
-            FROM trades
-            WHERE discord_id = ?
-            AND symbol = ?
-        """, (discord_id, symbol)).fetchall()
-
-        owned_shares = Decimal("0")
-
-        for trade in trades:
-            trade_quantity = Decimal(trade["quantity"])
-
-            if trade["side"] == "BUY":
-                owned_shares += trade_quantity
-            else:
-                owned_shares -= trade_quantity
-
-
-        if quantity is None:
-            quantity = owned_shares
+        quantity = (amount / price).quantize(QUANTITY_PLACES, rounding=ROUND_DOWN)
 
         if quantity <= 0:
-            raise ValueError("You do not own any shares of this stock.")
+            raise ValueError("Sale amount is too small.")
 
-        if quantity > owned_shares:
-            raise ValueError(
-                f"Insufficient shares. You own {owned_shares} shares."
+    elif quantity is not None:
+        quantity = _to_quantity(quantity)
+
+    with get_connection(write=True) as connection:
+        _active_user(connection, discord_id)
+        owned = _replay(connection, discord_id)[1].get(symbol, Decimal(0))
+
+        if owned <= 0:
+            raise ValueError(f"You do not own any shares of {symbol}.")
+
+        sells_everything = quantity is None or quantity == owned
+
+        if quantity is None:
+            quantity = owned
+
+        if quantity > owned:
+            if dollar_amount is not None:
+                raise ValueError(
+                    f"Insufficient shares. Your {symbol} position is worth "
+                    f"approximately ${owned * price:,.2f}."
+                )
+            raise ValueError(f"Insufficient shares. You own {_text(owned)} shares.")
+
+        gross_cents = to_cents(quantity * price)
+
+        # A partial sale that rounds to $0 would just destroy shares.
+        if gross_cents < 1 and not sells_everything:
+            raise ValueError("Sale amount is too small.")
+
+        fee_cents = _fee_cents(
+            gross_cents, get_league_settings(connection)["fee_rate_bps"]
         )
-
-
-
-        gross_amount = quantity * price_per_share
-
-        gross_cents = int(
-            (gross_amount * 100).quantize(
-                Decimal("1"),
-                rounding = ROUND_HALF_UP
-            )
-        )
-
-        settings = connection.execute("""
-            SELECT fee_rate_bps
-            FROM league_settings
-            WHERE setting_id = 1
-        """).fetchone()
-
-        if settings is None:
-            raise RuntimeError("League settings have not been initialized.")
-
-        fee_rate = Decimal(settings["fee_rate_bps"]) / Decimal("10000")
-
-        fee_cents = int(
-            (Decimal(gross_cents) * fee_rate).quantize(
-                Decimal("1"),
-                rounding=ROUND_HALF_UP
-            )
-        )
-
         net_proceeds = gross_cents - fee_cents
 
         connection.execute("""
-            UPDATE users
-            SET cash_balance_cents = cash_balance_cents + ?
+            UPDATE users SET cash_balance_cents = cash_balance_cents + ?
             WHERE discord_id = ?
         """, (net_proceeds, discord_id))
 
-        connection.execute("""
-                INSERT INTO trades (
-                    discord_id,
-                    symbol,
-                    side,
-                    quantity,
-                    price_per_share,
-                    gross_amount_cents,
-                    fee_cents,
-                    price_date
-                )
-                VALUES (?, ?, 'SELL', ?, ?, ?, ?, ?)
-            """, (
-                discord_id,
-                symbol,
-                str(quantity),
-                str(price_per_share),
-                gross_cents,
-                fee_cents,
-                price_date
-            ))
+        _insert_trade(connection, discord_id, symbol, "SELL", quantity, price,
+                      gross_cents, fee_cents, price_date)
 
-        return {
-            "symbol": symbol,
-            "quantity": quantity,
-            "price_per_share": price_per_share,
-            "gross_amount_cents": gross_cents,
-            "fee_cents": fee_cents,
-            "net_proceeds_cents": net_proceeds
+    return {
+        "symbol": symbol,
+        "quantity": quantity,
+        "price_per_share": price,
+        "gross_amount_cents": gross_cents,
+        "fee_cents": fee_cents,
+        "net_proceeds_cents": net_proceeds,
     }
 
 
-def sell_stock_by_amount(
-    discord_id: str,
-    symbol: str,
-    dollar_amount: Decimal,
-    price_per_share: Decimal,
-    price_date: str
-):
-    """
-    Sell enough fractional shares to generate the requested
-    gross sale amount, subject to the user's available holdings.
-    """
-
-    dollar_amount = Decimal(str(dollar_amount))
-    price_per_share = Decimal(str(price_per_share))
-
-    if dollar_amount <= 0:
-        raise ValueError("Sale amount must be greater than zero.")
-
-    if price_per_share <= 0:
-        raise ValueError("Price must be greater than zero.")
-
-    portfolio = get_portfolio(discord_id)
-    symbol = symbol.upper().strip()
-
-    if symbol not in portfolio["holdings"]:
-        raise ValueError(f"You do not own any shares of {symbol}.")
-
-    owned_shares = portfolio["holdings"][symbol]
-    requested_quantity = dollar_amount / price_per_share
-
-    if requested_quantity > owned_shares:
-        raise ValueError(
-            f"Insufficient shares. Your {symbol} position is worth "
-            f"approximately ${owned_shares * price_per_share:,.2f}."
-        )
-
-    return sell_stock(
-        discord_id,
-        symbol,
-        requested_quantity,
-        price_per_share,
-        price_date
-    )
+def sell_stock(discord_id, symbol, quantity, price_per_share, price_date):
+    """Sell shares. Pass quantity=None to sell the whole position."""
+    return _sell(discord_id, symbol, quantity, None, price_per_share, price_date)
 
 
-def get_portfolio(discord_id: str):
-    """
-    Retrieve a user's cash balance and current stock holdings.
-    Holdings are reconstructed from the trade ledger.
-    """
+def sell_stock_by_amount(discord_id, symbol, dollar_amount, price_per_share, price_date):
+    """Sell enough shares to raise the gross dollar amount."""
+    return _sell(discord_id, symbol, None, dollar_amount, price_per_share, price_date)
 
+
+# ---- reading portfolios --------------------------------------------------
+
+def get_portfolio(discord_id):
+    """Cash and share counts. Holdings come from the trade ledger."""
     with get_connection() as connection:
-
         user = connection.execute("""
             SELECT discord_id, username, cash_balance_cents
-            FROM users
-            WHERE discord_id = ?
+            FROM users WHERE discord_id = ?
         """, (discord_id,)).fetchone()
 
         if user is None:
             raise ValueError("User does not exist.")
 
-        trades = connection.execute("""
-            SELECT symbol, side, quantity
-            FROM trades
-            WHERE discord_id = ?
-        """, (discord_id,)).fetchall()
+        holdings = _replay(connection, discord_id)[1]
+
+    return {
+        "discord_id": user["discord_id"],
+        "username": user["username"],
+        "cash_balance": Decimal(user["cash_balance_cents"]) / 100,
+        "holdings": holdings,
+    }
 
 
-        holdings = {}
+def _value_holdings(holdings, prices):
+    valued = {}
 
-        for trade in trades:
-            symbol = trade["symbol"]
-            quantity = Decimal(trade["quantity"])
-
-            if symbol not in holdings:
-                holdings[symbol] = Decimal("0")
-
-            if trade["side"] == "BUY":
-                holdings[symbol] += quantity
-            else:
-                holdings[symbol] -= quantity
-
-        holdings = {
-            symbol: quantity
-            for symbol, quantity in holdings.items()
-            if quantity > 0
-        }
-
-        return {
-            "discord_id": user["discord_id"],
-            "username": user["username"],
-            "cash_balance": Decimal(user["cash_balance_cents"]) / 100,
-            "holdings": holdings
-        }
-
-def get_valued_portfolio(discord_id: str):
-    """
-    Retrieve a user's portfolio with current stored market prices.
-
-    Calculates individual holding values and total portfolio value.
-    """
-
-    # Retrieve the user's existing portfolio.
-    portfolio = get_portfolio(discord_id)
-
-    holdings_value = Decimal("0")
-    valued_holdings = {}
-
-    # Calculate the market value of each holding.
-    for symbol, quantity in portfolio["holdings"].items():
-
-        price = get_latest_price(symbol)
-
-        market_value = quantity * price
-
-        valued_holdings[symbol] = {
+    for symbol, quantity in holdings.items():
+        price = prices[symbol]
+        valued[symbol] = {
             "quantity": quantity,
-            "price": price,
-            "market_value": market_value
+            "price": price["price"],
+            "price_date": price["price_date"],
+            "market_value": quantity * price["price"],
         }
 
-        holdings_value += market_value
+    return valued
 
-    # Calculate total portfolio value.
-    total_value = portfolio["cash_balance"] + holdings_value
+
+def get_valued_portfolio(discord_id):
+    """Portfolio valued at the latest stored closes."""
+    portfolio = get_portfolio(discord_id)
+    holdings = _value_holdings(
+        portfolio["holdings"], get_latest_prices(portfolio["holdings"])
+    )
+    holdings_value = sum((h["market_value"] for h in holdings.values()), Decimal(0))
 
     return {
         "discord_id": portfolio["discord_id"],
         "username": portfolio["username"],
         "cash_balance": portfolio["cash_balance"],
-        "holdings": valued_holdings,
+        "holdings": holdings,
         "holdings_value": holdings_value,
-        "total_value": total_value
+        "total_value": portfolio["cash_balance"] + holdings_value,
     }
 
 
-def get_historical_valued_portfolio(
-    discord_id: str,
-    target_date: str
-):
-    """
-    Reconstruct and value a user's portfolio
-    as of a specified historical date.
-    """
+def get_historical_valued_portfolio(discord_id, target_date, require_exact_prices=False):
+    """Rebuild a portfolio as of target_date from the ledger.
 
+    With require_exact_prices, every holding must have a close on that exact
+    date. Snapshots use this so a missing price can't quietly become a
+    stale one.
+    """
     with get_connection() as connection:
-
-        # Retrieve the user.
         user = connection.execute("""
-            SELECT discord_id, username
-            FROM users
-            WHERE discord_id = ?
+            SELECT discord_id, username, starting_balance_cents
+            FROM users WHERE discord_id = ?
         """, (discord_id,)).fetchone()
 
         if user is None:
             raise ValueError("User does not exist.")
 
-        # Retrieve the original starting balance.
-        settings = connection.execute("""
-            SELECT starting_balance_cents
-            FROM league_settings
-            WHERE setting_id = 1
-        """).fetchone()
+        start = user["starting_balance_cents"]
+        if start is None:
+            start = get_league_settings(connection)["starting_balance_cents"]
 
-        if settings is None:
-            raise RuntimeError("League settings have not been initialized.")
+        net_cash, holdings = _replay(connection, discord_id, target_date)
 
-        cash_balance = Decimal(
-            settings["starting_balance_cents"]
-        ) / 100
+    prices = get_prices_on_or_before(holdings, target_date)
 
-        # Retrieve all trades occurring on or before the target date.
-        trades = connection.execute("""
-            SELECT symbol, side, quantity,
-                   gross_amount_cents, fee_cents
-            FROM trades
-            WHERE discord_id = ?
-            AND price_date <= ?
-            ORDER BY price_date ASC, trade_id ASC
-        """, (discord_id, target_date)).fetchall()
+    if require_exact_prices:
+        for symbol, price in prices.items():
+            if price["price_date"] != target_date:
+                raise ValueError(f"No {symbol} close for {target_date}.")
 
-    # Reconstruct historical cash and holdings.
-    holdings = {}
-
-    for trade in trades:
-
-        symbol = trade["symbol"]
-        quantity = Decimal(trade["quantity"])
-
-        gross_amount = Decimal(trade["gross_amount_cents"]) / 100
-        fee = Decimal(trade["fee_cents"]) / 100
-
-        if symbol not in holdings:
-            holdings[symbol] = Decimal("0")
-
-        if trade["side"] == "BUY":
-            holdings[symbol] += quantity
-            cash_balance -= gross_amount + fee
-
-        else:
-            holdings[symbol] -= quantity
-            cash_balance += gross_amount - fee
-
-    # Calculate the historical market value of each holding.
-    valued_holdings = {}
-    holdings_value = Decimal("0")
-
-    for symbol, quantity in holdings.items():
-
-        if quantity <= 0:
-            continue
-
-        price_data = get_price_on_or_before(symbol, target_date)
-
-        market_value = quantity * price_data["price"]
-
-        valued_holdings[symbol] = {
-            "quantity": quantity,
-            "price": price_data["price"],
-            "price_date": price_data["price_date"],
-            "market_value": market_value
-        }
-
-        holdings_value += market_value
-
-    total_value = cash_balance + holdings_value
+    valued = _value_holdings(holdings, prices)
+    holdings_value = sum((h["market_value"] for h in valued.values()), Decimal(0))
+    cash_balance = Decimal(start + net_cash) / 100
 
     return {
         "discord_id": user["discord_id"],
         "username": user["username"],
         "snapshot_date": target_date,
         "cash_balance": cash_balance,
-        "holdings": valued_holdings,
+        "holdings": valued,
         "holdings_value": holdings_value,
-        "total_value": total_value
+        "total_value": cash_balance + holdings_value,
     }
 
 
-def save_portfolio_snapshot(discord_id: str, snapshot_date: str):
-    """
-    Save a daily snapshot of a user's portfolio.
-
-    Records cash, holdings value, and total portfolio value.
-    """
-
-    # Retrieve the user's current portfolio valuation.
+def save_portfolio_snapshot(discord_id, snapshot_date, require_exact_prices=False):
+    """Save (or recalculate) a user's end-of-day snapshot and position rows."""
     portfolio = get_historical_valued_portfolio(
-        discord_id,
-        snapshot_date)
-
-    # Convert dollar values into integer cents.
-    cash_cents = int(
-        (portfolio["cash_balance"] * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
+        discord_id, snapshot_date, require_exact_prices
     )
 
-    holdings_cents = int(
-        (portfolio["holdings_value"] * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
+    cash_cents = to_cents(portfolio["cash_balance"])
+    holdings_cents = to_cents(portfolio["holdings_value"])
     total_cents = cash_cents + holdings_cents
 
-    with get_connection() as connection:
-
+    with get_connection(write=True) as connection:
         connection.execute("""
             INSERT INTO portfolio_snapshots (
-                discord_id,
-                snapshot_date,
-                cash_balance_cents,
-                holdings_value_cents,
-                total_value_cents
+                discord_id, snapshot_date, cash_balance_cents,
+                holdings_value_cents, total_value_cents
             )
             VALUES (?, ?, ?, ?, ?)
-
-            ON CONFLICT(discord_id, snapshot_date)
-            DO NOTHING
-        """, (
-            discord_id,
-            snapshot_date,
-            cash_cents,
-            holdings_cents,
-            total_cents
-        ))
-        saved_snapshot = connection.execute("""
-            SELECT *
-            FROM portfolio_snapshots
-            WHERE discord_id = ?
-            AND snapshot_date = ?
-        """, (discord_id, snapshot_date)).fetchone()
-    return {
-        "discord_id": saved_snapshot["discord_id"],
-        "snapshot_date": saved_snapshot["snapshot_date"],
-        "cash_balance": Decimal(saved_snapshot["cash_balance_cents"]) / 100,
-        "holdings_value": Decimal(saved_snapshot["holdings_value_cents"]) / 100,
-        "total_value": Decimal(saved_snapshot["total_value_cents"]) / 100
-    }
-
-def recalculate_portfolio_snapshot(
-    discord_id: str,
-    snapshot_date: str
-):
-    """
-    Intentionally recalculate an existing historical snapshot.
-
-    Does not create a snapshot if one does not already exist.
-    """
-
-    # Confirm that a snapshot already exists.
-    with get_connection() as connection:
-
-        existing_snapshot = connection.execute("""
-            SELECT 1
-            FROM portfolio_snapshots
-            WHERE discord_id = ?
-            AND snapshot_date = ?
-        """, (discord_id, snapshot_date)).fetchone()
-
-        if existing_snapshot is None:
-            raise ValueError(
-                "Cannot recalculate a snapshot that does not exist."
-            )
-
-    # Reconstruct the portfolio's value on that date.
-    portfolio = get_historical_valued_portfolio(
-        discord_id,
-        snapshot_date
-    )
-
-    # Convert dollar values into integer cents.
-    cash_cents = int(
-        (portfolio["cash_balance"] * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
-    holdings_cents = int(
-        (portfolio["holdings_value"] * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
-    total_cents = cash_cents + holdings_cents
-
-    # Intentionally replace the existing snapshot.
-    with get_connection() as connection:
+            ON CONFLICT(discord_id, snapshot_date) DO UPDATE SET
+                cash_balance_cents = excluded.cash_balance_cents,
+                holdings_value_cents = excluded.holdings_value_cents,
+                total_value_cents = excluded.total_value_cents
+        """, (discord_id, snapshot_date, cash_cents, holdings_cents, total_cents))
 
         connection.execute("""
-            UPDATE portfolio_snapshots
-            SET
-                cash_balance_cents = ?,
-                holdings_value_cents = ?,
-                total_value_cents = ?
-            WHERE discord_id = ?
-            AND snapshot_date = ?
-        """, (
-            cash_cents,
-            holdings_cents,
-            total_cents,
-            discord_id,
-            snapshot_date
-        ))
+            DELETE FROM position_snapshots
+            WHERE discord_id = ? AND snapshot_date = ?
+        """, (discord_id, snapshot_date))
+
+        connection.executemany("""
+            INSERT INTO position_snapshots (
+                discord_id, snapshot_date, symbol, quantity, price, market_value_cents
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, [
+            (discord_id, snapshot_date, symbol, _text(h["quantity"]),
+             _text(h["price"]), to_cents(h["market_value"]))
+            for symbol, h in portfolio["holdings"].items()
+        ])
 
     return {
         "discord_id": discord_id,
         "snapshot_date": snapshot_date,
         "cash_balance": Decimal(cash_cents) / 100,
         "holdings_value": Decimal(holdings_cents) / 100,
-        "total_value": Decimal(total_cents) / 100
+        "total_value": Decimal(total_cents) / 100,
     }
 
+
 def get_active_symbols():
-    """
-    Retrieve every stock currently held by at least
-    one active league participant.
-    """
+    """Symbols currently held by at least one active user."""
+    with get_connection() as connection:
+        user_ids = [
+            row["discord_id"]
+            for row in connection.execute(
+                "SELECT discord_id FROM users WHERE is_active = 1"
+            )
+        ]
+        symbols = set()
+
+        for discord_id in user_ids:
+            symbols.update(_replay(connection, discord_id)[1])
+
+    return sorted(symbols)
+
+
+def get_recent_trades(discord_id, limit=10):
+    with get_connection() as connection:
+        rows = connection.execute("""
+            SELECT symbol, side, quantity, price_per_share,
+                   gross_amount_cents, fee_cents, price_date, executed_at
+            FROM trades WHERE discord_id = ?
+            ORDER BY trade_id DESC LIMIT ?
+        """, (discord_id, limit)).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def find_cash_mismatches():
+    """Users whose stored cash doesn't match what the ledger says it should be."""
+    mismatches = []
 
     with get_connection() as connection:
+        default_start = get_league_settings(connection)["starting_balance_cents"]
 
-        trades = connection.execute("""
-            SELECT
-                trades.discord_id,
-                trades.symbol,
-                trades.side,
-                trades.quantity
-            FROM trades
-            JOIN users
-                ON trades.discord_id = users.discord_id
-            WHERE users.is_active = 1
-        """).fetchall()
+        for user in connection.execute("SELECT * FROM users").fetchall():
+            start = user["starting_balance_cents"]
+            start = default_start if start is None else start
+            expected = start + _replay(connection, user["discord_id"])[0]
 
-        holdings = {}
+            if expected != user["cash_balance_cents"]:
+                mismatches.append({
+                    "discord_id": user["discord_id"],
+                    "username": user["username"],
+                    "stored_cents": user["cash_balance_cents"],
+                    "expected_cents": expected,
+                })
 
-        for trade in trades:
-            key = (trade["discord_id"], trade["symbol"])
-
-            if key not in holdings:
-                holdings[key] = Decimal("0")
-
-            quantity = Decimal(trade["quantity"])
-
-            if trade["side"] == "BUY":
-                holdings[key] += quantity
-            else:
-                holdings[key] -= quantity
-
-        symbols = {
-            symbol
-            for (discord_id, symbol), quantity in holdings.items()
-            if quantity > 0
-        }
-
-        return sorted(symbols)
-
-
-def get_active_users():
-    """
-    Retrieve the Discord IDs of all active league participants.
-    """
-
-    with get_connection() as connection:
-
-        users = connection.execute("""
-            SELECT discord_id
-            FROM users
-            WHERE is_active = 1
-            ORDER BY discord_id
-        """).fetchall()
-
-        return [user["discord_id"] for user in users]
-
-
-
+    return mismatches
