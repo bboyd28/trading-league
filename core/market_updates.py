@@ -1,78 +1,102 @@
-from core.portfolio import (
- get_active_symbols,
- get_active_users,
- save_portfolio_snapshot
+"""Daily job: download prices, then save every player's snapshot."""
+import logging
+from datetime import date, timedelta
+
+from core.leaderboard import get_latest_snapshot_date
+from core.market_calendar import (
+    is_trading_day,
+    last_completed_session,
+    trading_days_between,
 )
+from core.portfolio import get_active_symbols, get_active_users, save_portfolio_snapshot
 from core.prices import update_stock_prices
 
+logger = logging.getLogger(__name__)
 
-def update_league_prices():
-    """
-    Update daily price history for every stock
-    currently held by an active league participant.
+BENCHMARK = "SPY"
 
-    Returns a report of successful updates and failures.
-    """
 
-    symbols = get_active_symbols()
-    symbols = sorted(set(symbols) | {"SPY"})
-
-    results = {
-        "updated": {},
-        "failed": {}
-    }
+def update_league_prices(period="1mo"):
+    """Download prices for every held stock plus the benchmark."""
+    symbols = sorted(set(get_active_symbols()) | {BENCHMARK})
+    results = {"updated": {}, "failed": {}}
 
     for symbol in symbols:
-
         try:
-            count = update_stock_prices(symbol)
-
-            results["updated"][symbol] = count
-
+            results["updated"][symbol] = update_stock_prices(symbol, period=period)
         except Exception as error:
+            logger.warning("Price update failed for %s: %s", symbol, error)
             results["failed"][symbol] = str(error)
 
     return results
 
-def run_daily_market_update(snapshot_date: str):
+
+def _save_snapshots(snapshot_date):
+    """Snapshot every active player. A player is skipped if any price is missing."""
+    saved = []
+    failures = {}
+
+    for discord_id in get_active_users():
+        try:
+            save_portfolio_snapshot(discord_id, snapshot_date, require_exact_prices=True)
+            saved.append(discord_id)
+        except Exception as error:
+            logger.warning("Snapshot failed for %s: %s", discord_id, error)
+            failures[discord_id] = str(error)
+
+    return saved, failures
+
+
+def run_daily_market_update(snapshot_date=None, now=None):
+    """Update prices, then save snapshots for one trading day.
+
+    Defaults to the last completed session. A failed benchmark download does
+    not block snapshots; a failed price only affects players who hold it.
     """
-    Run the complete daily market update process.
+    snapshot_date = snapshot_date or last_completed_session(now).isoformat()
 
-    Updates stock prices first, then saves portfolio
-    snapshots for every active participant.
-    """
-
-    # First, update all stock prices.
-    price_results = update_league_prices()
-
-    # Do not save snapshots if any price update failed.
-    if price_results["failed"]:
+    if not is_trading_day(date.fromisoformat(snapshot_date)):
         return {
-            "price_updates": price_results,
+            "snapshot_date": snapshot_date,
+            "price_updates": {"updated": {}, "failed": {}},
             "snapshots_saved": [],
             "snapshot_failures": {},
-            "skipped": True
+            "skipped": True,
         }
 
-    # Retrieve all active participants.
-    users = get_active_users()
+    price_updates = update_league_prices()
+    saved, failures = _save_snapshots(snapshot_date)
 
-    results = {
-        "price_updates": price_results,
-        "snapshots_saved": [],
-        "snapshot_failures": {},
-        "skipped": False
+    return {
+        "snapshot_date": snapshot_date,
+        "price_updates": price_updates,
+        "snapshots_saved": saved,
+        "snapshot_failures": failures,
+        "skipped": False,
     }
 
-    # Save a snapshot for every participant.
-    for discord_id in users:
 
-        try:
-            save_portfolio_snapshot(discord_id, snapshot_date)
+def backfill_snapshots(start_date, end_date):
+    """Save snapshots for every trading day in a range (after downtime)."""
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    price_updates = update_league_prices(period="3mo")
+    days = {}
 
-            results["snapshots_saved"].append(discord_id)
+    for day in trading_days_between(start, end):
+        saved, failures = _save_snapshots(day.isoformat())
+        days[day.isoformat()] = {"saved": saved, "failures": failures}
 
-        except Exception as error:
-            results["snapshot_failures"][discord_id] = str(error)
+    return {"price_updates": price_updates, "days": days}
 
-    return results
+
+def catch_up_snapshots(now=None):
+    """If the bot missed days, fill in snapshots up to the last session."""
+    latest = get_latest_snapshot_date()
+    last_session = last_completed_session(now)
+
+    if latest is None or date.fromisoformat(latest) >= last_session:
+        return None
+
+    start = date.fromisoformat(latest) + timedelta(days=1)
+    return backfill_snapshots(start.isoformat(), last_session.isoformat())

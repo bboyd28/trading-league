@@ -1,430 +1,253 @@
-from decimal import Decimal
-from core.database import get_connection
+"""Performance metrics built from daily portfolio snapshots.
 
+Snapshots are saved on trading days only, so annualizing with 252 days
+is fair. The benchmark uses plain closes (no dividends), the same way
+portfolios are valued here.
+"""
 import statistics
+from decimal import Decimal
 
-def get_daily_returns(discord_id: str):
-    """
-    Calculate daily portfolio returns using historical snapshots.
+from core.database import get_connection
+from core.prices import normalize_symbol
 
-    Returns the percentage change in portfolio value
-    between consecutive snapshots.
-    """
+TRADING_DAYS = 252
 
+
+# ---- loading -------------------------------------------------------------
+
+def _load_snapshots(discord_id):
     with get_connection() as connection:
-
-        snapshots = connection.execute("""
+        rows = connection.execute("""
             SELECT snapshot_date, total_value_cents
             FROM portfolio_snapshots
             WHERE discord_id = ?
-            ORDER BY snapshot_date ASC
+            ORDER BY snapshot_date
         """, (discord_id,)).fetchall()
 
-    if len(snapshots) < 2:
-        return []
-
-    daily_returns = []
-
-    for previous, current in zip(snapshots, snapshots[1:]):
-
-        previous_value = Decimal(
-            previous["total_value_cents"]
-        )
-
-        current_value = Decimal(
-            current["total_value_cents"]
-        )
-
-        daily_return = (
-            (current_value - previous_value)
-            / previous_value
-        ) * 100
-
-        daily_returns.append({
-            "date": current["snapshot_date"],
-            "daily_return": daily_return
-        })
-
-    return daily_returns
-
-def get_cumulative_returns(discord_id: str):
-    """
-    Calculate cumulative portfolio returns over time.
-
-    Measures total performance relative to the
-    participant's original starting balance.
-    """
-
-    daily_returns = get_daily_returns(discord_id)
-
-    if not daily_returns:
-        return []
-
-    cumulative_returns = []
-
-    cumulative_growth = Decimal("1")
-
-    for observation in daily_returns:
-
-        daily_return = observation["daily_return"]
-
-        cumulative_growth *= (
-            Decimal("1") + daily_return / Decimal("100")
-        )
-
-        cumulative_return = (
-            cumulative_growth - Decimal("1")
-        ) * Decimal("100")
-
-        cumulative_returns.append({
-            "date": observation["date"],
-            "cumulative_return": cumulative_return
-        })
-
-    return cumulative_returns
+    return [(row["snapshot_date"], Decimal(row["total_value_cents"])) for row in rows]
 
 
-def get_benchmark_daily_returns(
-    start_date: str,
-    end_date: str,
-    symbol: str = "SPY"
-):
-    """
-    Calculate daily benchmark returns using adjusted closing prices.
-
-    Includes the last available trading price on or before
-    start_date as the baseline for calculating returns.
-    """
-
-    symbol = symbol.upper().strip()
-
-    if not symbol:
-        raise ValueError("Benchmark symbol is required.")
+def _load_benchmark(start_date, end_date, symbol):
+    """Closes from the last trading day on or before start_date through end_date."""
+    symbol = normalize_symbol(symbol)
 
     if start_date > end_date:
         raise ValueError("Start date cannot be after end date.")
 
     with get_connection() as connection:
+        baseline = connection.execute("""
+            SELECT MAX(price_date) AS price_date FROM price_history
+            WHERE symbol = ? AND price_date <= ?
+        """, (symbol, start_date)).fetchone()["price_date"]
 
-        prices = connection.execute("""
-            SELECT price_date, adjusted_close
-            FROM price_history
-            WHERE symbol = ?
-            AND price_date <= ?
-            AND price_date >= (
-                SELECT MAX(price_date)
-                FROM price_history
-                WHERE symbol = ?
-                AND price_date <= ?
-                AND adjusted_close IS NOT NULL
+        if baseline is None:
+            raise ValueError(
+                f"No price history found for {symbol} on or before {start_date}."
             )
-            AND adjusted_close IS NOT NULL
-            ORDER BY price_date ASC
-        """, (
-            symbol,
-            end_date,
-            symbol,
-            start_date
-        )).fetchall()
 
-    if not prices:
-        raise ValueError(
-            f"No adjusted price history found for {symbol} "
-            f"on or before {start_date}."
-        )
+        rows = connection.execute("""
+            SELECT price_date, close_price FROM price_history
+            WHERE symbol = ? AND price_date >= ? AND price_date <= ?
+            ORDER BY price_date
+        """, (symbol, baseline, end_date)).fetchall()
 
-    if len(prices) < 2:
-        return []
-
-    benchmark_returns = []
-
-    for previous, current in zip(prices, prices[1:]):
-
-        previous_price = Decimal(previous["adjusted_close"])
-        current_price = Decimal(current["adjusted_close"])
-
-        daily_return = (
-            (current_price - previous_price)
-            / previous_price
-        ) * 100
-
-        benchmark_returns.append({
-            "date": current["price_date"],
-            "daily_return": daily_return
-        })
-
-    return benchmark_returns
-
-def get_benchmark_cumulative_returns(
-    start_date: str,
-    end_date: str,
-    symbol: str = "SPY"
-):
-    """
-    Calculate cumulative benchmark returns over time.
-    """
-
-    daily_returns = get_benchmark_daily_returns(
-        start_date,
-        end_date,
-        symbol
-    )
-
-    if not daily_returns:
-        return []
-
-    cumulative_returns = []
-    cumulative_growth = Decimal("1")
-
-    for observation in daily_returns:
-
-        daily_return = observation["daily_return"]
-
-        cumulative_growth *= (
-            Decimal("1") + daily_return / Decimal("100")
-        )
-
-        cumulative_return = (
-            cumulative_growth - Decimal("1")
-        ) * Decimal("100")
-
-        cumulative_returns.append({
-            "date": observation["date"],
-            "cumulative_return": cumulative_return
-        })
-
-    return cumulative_returns
+    return [(row["price_date"], Decimal(row["close_price"])) for row in rows]
 
 
-def compare_portfolio_to_benchmark(
-    discord_id: str,
-    symbol: str = "SPY"
-):
-    """
-    Compare a participant's cumulative returns
-    against a market benchmark.
+# ---- pure math (no database) ---------------------------------------------
 
-    Returns results for dates shared by both datasets.
-    """
-
-    portfolio_returns = get_cumulative_returns(discord_id)
-
-    if not portfolio_returns:
-        return []
-
-    # Find the participant's first recorded snapshot.
-    with get_connection() as connection:
-
-        first_snapshot = connection.execute("""
-            SELECT MIN(snapshot_date) AS first_date
-            FROM portfolio_snapshots
-            WHERE discord_id = ?
-        """, (discord_id,)).fetchone()
-
-    start_date = first_snapshot["first_date"]
-    end_date = portfolio_returns[-1]["date"]
-
-    # Calculate benchmark performance over the same period.
-    benchmark_returns = get_benchmark_cumulative_returns(
-        start_date,
-        end_date,
-        symbol
-    )
-
-    # Organize benchmark results by date.
-    benchmark_by_date = {
-        observation["date"]: observation["cumulative_return"]
-        for observation in benchmark_returns
-    }
-
-    comparisons = []
-
-    for observation in portfolio_returns:
-
-        date = observation["date"]
-
-        if date not in benchmark_by_date:
-            continue
-
-        portfolio_return = observation["cumulative_return"]
-        benchmark_return = benchmark_by_date[date]
-
-        comparisons.append({
-            "date": date,
-            "portfolio_return": portfolio_return,
-            "benchmark_return": benchmark_return,
-            "excess_return": portfolio_return - benchmark_return
-        })
-
-    return comparisons
-
-
-def get_portfolio_volatility(discord_id: str):
-    """
-    Calculate annualized historical portfolio volatility.
-
-    Uses the sample standard deviation of daily returns.
-    """
-
-    daily_returns = get_daily_returns(discord_id)
-
-    if len(daily_returns) < 2:
-        return None
-
-    returns = [
-        float(observation["daily_return"]) / 100
-        for observation in daily_returns
+def _pct_changes(series):
+    """Percent change between consecutive (date, value) pairs."""
+    return [
+        {"date": date, "daily_return": ((value - previous) / previous) * 100}
+        for (_, previous), (date, value) in zip(series, series[1:])
     ]
 
-    daily_volatility = statistics.stdev(returns)
 
-    annualized_volatility = daily_volatility * (252 ** 0.5)
+def _compound(daily):
+    growth = Decimal("1")
+    cumulative = []
 
-    return Decimal(str(annualized_volatility)) * 100
+    for observation in daily:
+        growth *= Decimal("1") + observation["daily_return"] / Decimal("100")
+        cumulative.append({
+            "date": observation["date"],
+            "cumulative_return": (growth - Decimal("1")) * Decimal("100"),
+        })
+
+    return cumulative
 
 
-def get_sharpe_ratio(
-    discord_id: str,
-    risk_free_rate: Decimal = Decimal("0")
-):
-    """
-    Calculate the annualized Sharpe ratio of a portfolio.
+def _fractions(daily):
+    return [float(o["daily_return"]) / 100 for o in daily]
 
-    Risk-free rate is expressed as an annual percentage.
-    """
 
+def _volatility(returns):
+    if len(returns) < 2:
+        return None
+
+    annual = statistics.stdev(returns) * (TRADING_DAYS ** 0.5)
+    return Decimal(str(annual)) * 100
+
+
+def _sharpe(returns, risk_free_rate):
+    if len(returns) < 2:
+        return None
+
+    daily_risk_free = (1 + float(risk_free_rate) / 100) ** (1 / TRADING_DAYS) - 1
+    excess = [r - daily_risk_free for r in returns]
+    spread = statistics.stdev(excess)
+
+    if spread == 0:
+        return None
+
+    return Decimal(str(statistics.mean(excess) / spread * (TRADING_DAYS ** 0.5)))
+
+
+def _max_drawdown(series):
+    if len(series) < 2:
+        return None
+
+    peak = series[0][1]
+    worst = Decimal("0")
+
+    for _, value in series[1:]:
+        peak = max(peak, value)
+        worst = min(worst, ((value - peak) / peak) * 100)
+
+    return worst
+
+
+def _beta(portfolio_daily, benchmark_daily):
+    mine = {o["date"]: float(o["daily_return"]) / 100 for o in portfolio_daily}
+    market = {o["date"]: float(o["daily_return"]) / 100 for o in benchmark_daily}
+    shared = sorted(set(mine) & set(market))
+
+    if len(shared) < 2:
+        return None
+
+    market_returns = [market[d] for d in shared]
+    variance = statistics.variance(market_returns)
+
+    if variance == 0:
+        return None
+
+    covariance = statistics.covariance([mine[d] for d in shared], market_returns)
+    return Decimal(str(covariance / variance))
+
+
+def _check_risk_free(risk_free_rate):
     if risk_free_rate <= Decimal("-100"):
         raise ValueError("Risk-free rate must be greater than -100%.")
 
-    daily_returns = get_daily_returns(discord_id)
 
-    if len(daily_returns) < 2:
-        return None
+# ---- public functions ----------------------------------------------------
 
-    returns = [
-        float(observation["daily_return"]) / 100
-        for observation in daily_returns
-    ]
-
-    annual_risk_free_rate = float(risk_free_rate) / 100
-
-    daily_risk_free_rate = (
-        (1 + annual_risk_free_rate) ** (1 / 252)
-    ) - 1
-
-    excess_returns = [
-        daily_return - daily_risk_free_rate
-        for daily_return in returns
-    ]
-
-    average_excess_return = statistics.mean(excess_returns)
-    daily_volatility = statistics.stdev(returns)
-
-    if daily_volatility == 0:
-        return None
-
-    sharpe_ratio = (
-        average_excess_return / daily_volatility
-    ) * (252 ** 0.5)
-
-    return Decimal(str(sharpe_ratio))
+def get_daily_returns(discord_id):
+    return _pct_changes(_load_snapshots(discord_id))
 
 
-def get_max_drawdown(discord_id: str):
-    """
-    Calculate the maximum drawdown of a portfolio.
-
-    Returns the largest percentage decline from a previous
-    portfolio peak to a subsequent trough.
-    """
-
-    with get_connection() as connection:
-        snapshots = connection.execute("""
-            SELECT snapshot_date, total_value_cents
-            FROM portfolio_snapshots
-            WHERE discord_id = ?
-            ORDER BY snapshot_date ASC
-        """, (discord_id,)).fetchall()
-
-    if len(snapshots) < 2:
-        return None
-
-    peak_value = Decimal(snapshots[0]["total_value_cents"])
-    max_drawdown = Decimal("0")
-
-    for snapshot in snapshots[1:]:
-        current_value = Decimal(snapshot["total_value_cents"])
-
-        if current_value > peak_value:
-            peak_value = current_value
-
-        drawdown = (
-            (current_value - peak_value) / peak_value
-        ) * 100
-
-        if drawdown < max_drawdown:
-            max_drawdown = drawdown
-
-    return max_drawdown
+def get_cumulative_returns(discord_id):
+    return _compound(get_daily_returns(discord_id))
 
 
-def get_portfolio_beta(discord_id: str, symbol: str = "SPY"):
-    """
-    Calculate portfolio beta relative to a market benchmark.
+def get_benchmark_daily_returns(start_date, end_date, symbol="SPY"):
+    return _pct_changes(_load_benchmark(start_date, end_date, symbol))
 
-    Beta measures how sensitive portfolio returns are to
-    movements in the benchmark.
-    """
 
-    portfolio_returns = get_daily_returns(discord_id)
+def get_benchmark_cumulative_returns(start_date, end_date, symbol="SPY"):
+    return _compound(get_benchmark_daily_returns(start_date, end_date, symbol))
 
-    if len(portfolio_returns) < 2:
-        return None
 
-    first_date = portfolio_returns[0]["date"]
-    last_date = portfolio_returns[-1]["date"]
+def compare_portfolio_to_benchmark(discord_id, symbol="SPY"):
+    """Cumulative portfolio vs benchmark return on the dates both have."""
+    snapshots = _load_snapshots(discord_id)
+    portfolio = _compound(_pct_changes(snapshots))
 
-    benchmark_returns = get_benchmark_daily_returns(
-        first_date,
-        last_date,
-        symbol
-    )
+    if not portfolio:
+        return []
 
-    portfolio_by_date = {
-        observation["date"]: float(observation["daily_return"]) / 100
-        for observation in portfolio_returns
+    benchmark = {
+        o["date"]: o["cumulative_return"]
+        for o in get_benchmark_cumulative_returns(
+            snapshots[0][0], snapshots[-1][0], symbol
+        )
     }
 
-    benchmark_by_date = {
-        observation["date"]: float(observation["daily_return"]) / 100
-        for observation in benchmark_returns
+    return [
+        {
+            "date": o["date"],
+            "portfolio_return": o["cumulative_return"],
+            "benchmark_return": benchmark[o["date"]],
+            "excess_return": o["cumulative_return"] - benchmark[o["date"]],
+        }
+        for o in portfolio
+        if o["date"] in benchmark
+    ]
+
+
+def get_portfolio_volatility(discord_id):
+    """Annualized volatility, in percent."""
+    return _volatility(_fractions(get_daily_returns(discord_id)))
+
+
+def get_sharpe_ratio(discord_id, risk_free_rate=Decimal("0")):
+    """Annualized Sharpe ratio. risk_free_rate is an annual percent."""
+    _check_risk_free(risk_free_rate)
+    return _sharpe(_fractions(get_daily_returns(discord_id)), risk_free_rate)
+
+
+def get_max_drawdown(discord_id):
+    """Largest peak-to-trough drop, in percent (a negative number)."""
+    return _max_drawdown(_load_snapshots(discord_id))
+
+
+def get_portfolio_beta(discord_id, symbol="SPY"):
+    snapshots = _load_snapshots(discord_id)
+    daily = _pct_changes(snapshots)
+
+    if len(daily) < 2:
+        return None
+
+    benchmark = _pct_changes(_load_benchmark(snapshots[0][0], snapshots[-1][0], symbol))
+    return _beta(daily, benchmark)
+
+
+def get_performance_summary(discord_id, symbol="SPY", risk_free_rate=Decimal("0")):
+    """Every headline metric from a single database read. None if too little data."""
+    _check_risk_free(risk_free_rate)
+    snapshots = _load_snapshots(discord_id)
+    daily = _pct_changes(snapshots)
+
+    if not daily:
+        return None
+
+    returns = _fractions(daily)
+    first, last = snapshots[0], snapshots[-1]
+    total_return = ((last[1] - first[1]) / first[1]) * 100
+
+    summary = {
+        "start_date": first[0],
+        "end_date": last[0],
+        "observations": len(daily),
+        "total_return_pct": total_return,
+        "volatility_pct": _volatility(returns),
+        "sharpe": _sharpe(returns, risk_free_rate),
+        "max_drawdown_pct": _max_drawdown(snapshots),
+        "beta": None,
+        "benchmark_return_pct": None,
+        "excess_return_pct": None,
     }
 
-    common_dates = sorted(
-        set(portfolio_by_date) & set(benchmark_by_date)
-    )
+    try:
+        closes = _load_benchmark(first[0], last[0], symbol)
+    except ValueError:
+        return summary
 
-    if len(common_dates) < 2:
-        return None
+    if len(closes) >= 2:
+        benchmark_total = ((closes[-1][1] - closes[0][1]) / closes[0][1]) * 100
+        summary["beta"] = _beta(daily, _pct_changes(closes))
+        summary["benchmark_return_pct"] = benchmark_total
+        summary["excess_return_pct"] = total_return - benchmark_total
 
-    aligned_portfolio = [
-        portfolio_by_date[date] for date in common_dates
-    ]
-
-    aligned_benchmark = [
-        benchmark_by_date[date] for date in common_dates
-    ]
-
-    benchmark_variance = statistics.variance(aligned_benchmark)
-
-    if benchmark_variance == 0:
-        return None
-
-    covariance = statistics.covariance(
-        aligned_portfolio,
-        aligned_benchmark
-    )
-
-    beta = covariance / benchmark_variance
-
-    return Decimal(str(beta))
+    return summary
