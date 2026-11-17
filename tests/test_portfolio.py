@@ -580,3 +580,78 @@ def test_recalculate_nonexistent_snapshot(setup_database):
             "123",
             "2026-11-14"
         )
+
+
+def test_buy_stock_by_amount(setup_database):
+    portfolio.register_user("123456789", "TestPlayer")
+
+    result = portfolio.buy_stock_by_amount(
+        "123456789",
+        "AAPL",
+        Decimal("500"),
+        Decimal("200"),
+        "2026-11-16"
+    )
+
+    assert result["quantity"] == Decimal("2.5")
+    assert result["gross_amount_cents"] == 50_000
+    assert result["fee_cents"] == 50
+    assert result["total_cost_cents"] == 50_050
+
+    user_portfolio = portfolio.get_portfolio("123456789")
+
+    assert user_portfolio["cash_balance"] == Decimal("99499.50")
+    assert user_portfolio["holdings"]["AAPL"] == Decimal("2.5")
+
+def test_sell_stock_by_amount(setup_database):
+    portfolio.register_user("123456789", "TestPlayer")
+
+    portfolio.buy_stock(
+        "123456789",
+        "AAPL",
+        Decimal("5"),
+        Decimal("100"),
+        "2026-11-14"
+    )
+
+    result = portfolio.sell_stock_by_amount(
+        "123456789",
+        "AAPL",
+        Decimal("200"),
+        Decimal("110"),
+        "2026-11-15"
+    )
+
+    assert result["gross_amount_cents"] == 20_000
+    assert result["fee_cents"] == 20
+    assert result["net_proceeds_cents"] == 19_980
+
+    user_portfolio = portfolio.get_portfolio("123456789")
+
+    assert user_portfolio["holdings"]["AAPL"] < Decimal("5")
+    assert user_portfolio["cash_balance"] == Decimal("99699.30")
+
+
+def test_sell_stock_by_amount_insufficient_shares(setup_database):
+    portfolio.register_user("123456789", "TestPlayer")
+
+    portfolio.buy_stock(
+        "123456789",
+        "AAPL",
+        Decimal("2"),
+        Decimal("100"),
+        "2026-11-14"
+    )
+
+    with pytest.raises(ValueError, match="Insufficient shares"):
+        portfolio.sell_stock_by_amount(
+            "123456789",
+            "AAPL",
+            Decimal("500"),
+            Decimal("110"),
+            "2026-11-15"
+        )
+
+    user_portfolio = portfolio.get_portfolio("123456789")
+
+    assert user_portfolio["holdings"]["AAPL"] == Decimal("2")

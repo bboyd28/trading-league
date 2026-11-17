@@ -166,6 +166,42 @@ def buy_stock(
         "total_cost_cents": total_cost
     }
 
+def buy_stock_by_amount(
+    discord_id: str,
+    symbol: str,
+    dollar_amount: Decimal,
+    price_per_share: Decimal,
+    price_date: str
+):
+    """
+    Purchase as many fractional shares as possible
+    using a specified dollar amount before transaction fees.
+    """
+
+    dollar_amount = Decimal(str(dollar_amount))
+    price_per_share = Decimal(str(price_per_share))
+
+    if dollar_amount <= 0:
+        raise ValueError("Dollar amount must be greater than zero.")
+
+    if price_per_share <= 0:
+        raise ValueError("Price must be greater than zero.")
+
+    quantity = dollar_amount / price_per_share
+
+    result = buy_stock(
+        discord_id,
+        symbol,
+        quantity,
+        price_per_share,
+        price_date
+    )
+
+    return result
+
+
+
+
 
 def sell_stock(
     discord_id: str,
@@ -182,11 +218,16 @@ def sell_stock(
     """
 
 
-    quantity = Decimal(str(quantity))
+    if str(quantity).strip().lower() == "all":
+        quantity = None
+    else:
+        quantity = Decimal(str(quantity))
+
     price_per_share = Decimal(str(price_per_share))
 
-    if quantity <= 0:
+    if quantity is not None and quantity <= 0:
         raise ValueError("Quantity must be greater than zero.")
+
     if price_per_share <= 0:
         raise ValueError("Price must be greater than zero.")
 
@@ -225,6 +266,12 @@ def sell_stock(
             else:
                 owned_shares -= trade_quantity
 
+
+        if quantity is None:
+            quantity = owned_shares
+
+        if quantity <= 0:
+            raise ValueError("You do not own any shares of this stock.")
 
         if quantity > owned_shares:
             raise ValueError(
@@ -298,6 +345,53 @@ def sell_stock(
             "fee_cents": fee_cents,
             "net_proceeds_cents": net_proceeds
     }
+
+
+def sell_stock_by_amount(
+    discord_id: str,
+    symbol: str,
+    dollar_amount: Decimal,
+    price_per_share: Decimal,
+    price_date: str
+):
+    """
+    Sell enough fractional shares to generate the requested
+    gross sale amount, subject to the user's available holdings.
+    """
+
+    dollar_amount = Decimal(str(dollar_amount))
+    price_per_share = Decimal(str(price_per_share))
+
+    if dollar_amount <= 0:
+        raise ValueError("Sale amount must be greater than zero.")
+
+    if price_per_share <= 0:
+        raise ValueError("Price must be greater than zero.")
+
+    portfolio = get_portfolio(discord_id)
+    symbol = symbol.upper().strip()
+
+    if symbol not in portfolio["holdings"]:
+        raise ValueError(f"You do not own any shares of {symbol}.")
+
+    owned_shares = portfolio["holdings"][symbol]
+    requested_quantity = dollar_amount / price_per_share
+
+    if requested_quantity > owned_shares:
+        raise ValueError(
+            f"Insufficient shares. Your {symbol} position is worth "
+            f"approximately ${owned_shares * price_per_share:,.2f}."
+        )
+
+    return sell_stock(
+        discord_id,
+        symbol,
+        requested_quantity,
+        price_per_share,
+        price_date
+    )
+
+
 def get_portfolio(discord_id: str):
     """
     Retrieve a user's cash balance and current stock holdings.
@@ -690,4 +784,6 @@ def get_active_users():
         """).fetchall()
 
         return [user["discord_id"] for user in users]
+
+
 
