@@ -3,4 +3,5 @@ python-dotenv
 yfinance
 pandas
 numpy
+tzdata
 pytest

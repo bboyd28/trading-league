@@ -1,21 +1,39 @@
+"""Slash commands. Each one hands the real work to core/ in a worker thread."""
+import asyncio
+import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-from decimal import Decimal
-from datetime import date
 
-from core.portfolio import (
-    get_valued_portfolio,
-    register_user,
-    get_portfolio,
-    buy_stock,
-    buy_stock_by_amount,
-    sell_stock,
-    sell_stock_by_amount
-)
-from core.leaderboard import get_leaderboard
-from core.prices import get_or_update_price
+from bot import embeds
+from core import analytics, execution, portfolio
+from core.leaderboard import get_standings
+from core.market_updates import run_daily_market_update
+
+logger = logging.getLogger(__name__)
+
+# Trade confirmations are private by default. Set True to show them in the channel.
+TRADES_PUBLIC = False
+
+trade_cooldown = app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+
+# Returned by run_blocking after it has already told the user what went wrong.
+FAILED = object()
+
+
+async def run_blocking(interaction, func, *args, public=True, **kwargs):
+    """Defer, run func off the event loop, and report user errors in place.
+
+    Returns FAILED if the user hit a ValueError or RuntimeError.
+    """
+    await interaction.response.defer(ephemeral=not public)
+
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except (ValueError, RuntimeError) as error:
+        await interaction.edit_original_response(content=str(error))
+        return FAILED
 
 
 class TradingCommands(commands.Cog):
@@ -23,475 +41,164 @@ class TradingCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(
-        name="portfolio",
-        description="View your current trading portfolio."
-    )
-    async def portfolio(self, interaction: discord.Interaction):
-
-        discord_id = str(interaction.user.id)
-
-        try:
-            result = get_valued_portfolio(discord_id)
-
-        except ValueError as error:
-            await interaction.response.send_message(
-                f"Could not retrieve your portfolio: {error}",
-                ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title=f"{result['username']}'s Portfolio",
-            color=discord.Color.blurple()
-        )
-
-        embed.add_field(
-            name="Cash Balance",
-            value=f"${result['cash_balance']:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Holdings Value",
-            value=f"${result['holdings_value']:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Total Portfolio Value",
-            value=f"${result['total_value']:,.2f}",
-            inline=False
-        )
-
-        holdings_text = ""
-
-        for symbol, holding in result["holdings"].items():
-            holdings_text += (
-                f"**{symbol}** — "
-                f"{holding['quantity']:,.4f} shares\n"
-                f"Price: ${holding['price']:,.2f} | "
-                f"Value: ${holding['market_value']:,.2f}\n\n"
-            )
-
-        if not holdings_text:
-            holdings_text = "You currently have no stock holdings."
-
-        embed.add_field(
-            name="Holdings",
-            value=holdings_text,
-            inline=False
-        )
-
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(
-        name="leaderboard",
-        description="View the trading league standings."
-    )
-    async def leaderboard(self, interaction: discord.Interaction):
-
-        snapshot_date = date.today().isoformat()
-
-        results = get_leaderboard(snapshot_date)
-
-        if not results:
-            await interaction.response.send_message(
-                "No leaderboard data is available for today yet.",
-                ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(
-            title="Trading League Leaderboard",
-            description=f"Standings for {snapshot_date}",
-            color=discord.Color.gold()
-        )
-
-        leaderboard_text = ""
-
-        for player in results:
-            leaderboard_text += (
-                f"**#{player['rank']} — {player['username']}**\n"
-                f"${player['total_value']:,.2f} "
-                f"({player['return_percentage']:+.2f}%)\n\n"
-            )
-
-        embed.description = leaderboard_text
-
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(
-        name="register",
-        description="Join the trading league."
-    )
+    @app_commands.command(name="register", description="Join the trading league.")
     async def register(self, interaction: discord.Interaction):
-
-        discord_id = str(interaction.user.id)
-        username = interaction.user.name
-
-        try:
-            register_user(discord_id, username)
-            portfolio = get_portfolio(discord_id)
-
-        except (ValueError, RuntimeError) as error:
-            await interaction.response.send_message(
-                f"Registration unsuccessful: {error}",
-                ephemeral=True
-            )
+        user = await run_blocking(
+            interaction, execution.register,
+            str(interaction.user.id), interaction.user.name, public=False,
+        )
+        if user is FAILED:
             return
 
-        embed = discord.Embed(
-            title="Welcome to the Trading League!",
-            description=(
-                f"You're registered as **{username}**.\n\n"
-                f"Your current cash balance is "
-                f"**${portfolio['cash_balance']:,.2f}**."
-            ),
-            color=discord.Color.green()
+        await interaction.edit_original_response(
+            embed=embeds.welcome_embed(user["username"], user["cash_balance_cents"] / 100)
         )
 
-        await interaction.response.send_message(
-            embed=embed,
-            ephemeral=True
+    @app_commands.command(name="portfolio", description="View your portfolio.")
+    async def portfolio(self, interaction: discord.Interaction):
+        result = await run_blocking(
+            interaction, portfolio.get_valued_portfolio, str(interaction.user.id)
         )
+        if result is not FAILED:
+            await interaction.edit_original_response(embed=embeds.portfolio_embed(result))
 
-    @app_commands.command(
-        name="buy",
-        description="Purchase shares of a stock."
-    )
-    async def buy(
-        self,
-        interaction: discord.Interaction,
-        symbol: str,
-        quantity: float
-    ):
+    async def _trade(self, interaction, symbol, side, **amounts):
+        result = await run_blocking(
+            interaction, execution.place_order,
+            str(interaction.user.id), symbol, side,
+            public=TRADES_PUBLIC, **amounts,
+        )
+        if result is not FAILED:
+            await interaction.edit_original_response(embed=embeds.trade_embed(result))
 
-        discord_id = str(interaction.user.id)
-        symbol = symbol.upper().strip()
+    @app_commands.command(name="buy", description="Buy shares of a stock.")
+    @app_commands.describe(symbol="Ticker, like AAPL", quantity="Number of shares, like 2.5")
+    @trade_cooldown
+    async def buy(self, interaction: discord.Interaction, symbol: str, quantity: str):
+        await self._trade(interaction, symbol, "BUY", quantity=quantity)
 
-        try:
-            price_data = get_or_update_price(
-                symbol,
-                date.today().isoformat()
-            )
+    @app_commands.command(name="buy-amount", description="Buy a dollar amount of a stock.")
+    @app_commands.describe(symbol="Ticker, like AAPL", amount="Dollars to spend before the fee")
+    @trade_cooldown
+    async def buy_amount(self, interaction: discord.Interaction, symbol: str, amount: str):
+        await self._trade(interaction, symbol, "BUY", amount=amount)
 
-            result = buy_stock(
-                discord_id,
-                symbol,
-                Decimal(str(quantity)),
-                price_data["price"],
-                price_data["price_date"]
-            )
+    @app_commands.command(name="sell", description="Sell shares, or your whole position.")
+    @app_commands.describe(symbol="Ticker, like AAPL", quantity="Number of shares, or 'all'")
+    @trade_cooldown
+    async def sell(self, interaction: discord.Interaction, symbol: str, quantity: str):
+        await self._trade(interaction, symbol, "SELL", quantity=quantity)
 
-        except (ValueError, RuntimeError) as error:
-            await interaction.response.send_message(
-                f"Purchase unsuccessful: {error}",
-                ephemeral=True
-            )
+    @app_commands.command(name="sell-amount", description="Sell a dollar amount of a stock.")
+    @app_commands.describe(symbol="Ticker, like AAPL", amount="Dollars to raise before the fee")
+    @trade_cooldown
+    async def sell_amount(self, interaction: discord.Interaction, symbol: str, amount: str):
+        await self._trade(interaction, symbol, "SELL", amount=amount)
+
+    @app_commands.command(name="leaderboard", description="See the league standings.")
+    @app_commands.describe(period="Which standings to show")
+    @app_commands.choices(period=[
+        app_commands.Choice(name="All time", value="all"),
+        app_commands.Choice(name="Past week", value="week"),
+        app_commands.Choice(name="Past month", value="month"),
+    ])
+    async def leaderboard(self, interaction: discord.Interaction,
+                          period: app_commands.Choice[str] = None):
+        standings = await run_blocking(
+            interaction, get_standings, period.value if period else "all"
+        )
+        if standings is FAILED:
             return
 
-        total_cost = result["total_cost_cents"] / 100
-        fee = result["fee_cents"] / 100
+        if standings is None:
+            await interaction.edit_original_response(
+                content="No standings yet. Snapshots are saved after each market close."
+            )
+        else:
+            await interaction.edit_original_response(embed=embeds.leaderboard_embed(standings))
 
-        embed = discord.Embed(
-            title="Purchase Successful",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(
-            name="Stock",
-            value=result["symbol"],
-            inline=True
-        )
-
-        embed.add_field(
-            name="Shares Purchased",
-            value=f"{result['quantity']:,.4f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Price Per Share",
-            value=f"${result['price_per_share']:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Transaction Fee",
-            value=f"${fee:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Total Cost",
-            value=f"${total_cost:,.2f}",
-            inline=True
-        )
-
-        embed.set_footer(
-            text=f"Execution price from {price_data['price_date']}"
-        )
-
-        await interaction.response.send_message(embed=embed)
-
-
-    @app_commands.command(
-        name="buy-amount",
-        description="Purchase stock using a dollar amount."
-    )
-    async def buy_amount(
-        self,
-        interaction: discord.Interaction,
-        symbol: str,
-        amount: float
-    ):
-
+    @app_commands.command(name="stats", description="Your return, risk, and beta vs SPY.")
+    async def stats(self, interaction: discord.Interaction):
         discord_id = str(interaction.user.id)
-        symbol = symbol.upper().strip()
 
-        try:
-            price_data = get_or_update_price(
-                symbol,
-                date.today().isoformat()
-            )
+        def load():
+            portfolio.get_portfolio(discord_id)   # raises if not registered
+            return analytics.get_performance_summary(discord_id)
 
-            result = buy_stock_by_amount(
-                discord_id,
-                symbol,
-                Decimal(str(amount)),
-                price_data["price"],
-                price_data["price_date"]
-            )
-
-        except (ValueError, RuntimeError) as error:
-            await interaction.response.send_message(
-                f"Purchase unsuccessful: {error}",
-                ephemeral=True
-            )
+        summary = await run_blocking(interaction, load)
+        if summary is FAILED:
             return
 
-        total_cost = result["total_cost_cents"] / 100
-        fee = result["fee_cents"] / 100
-        gross_amount = result["gross_amount_cents"] / 100
-
-        embed = discord.Embed(
-            title="Purchase Successful",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(
-            name="Stock",
-            value=result["symbol"],
-            inline=True
-        )
-
-        embed.add_field(
-            name="Shares Purchased",
-            value=f"{result['quantity']:,.4f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Price Per Share",
-            value=f"${result['price_per_share']:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Stock Purchase",
-            value=f"${gross_amount:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Transaction Fee",
-            value=f"${fee:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Total Cost",
-            value=f"${total_cost:,.2f}",
-            inline=True
-        )
-
-        embed.set_footer(
-            text=f"Execution price from {price_data['price_date']}"
-        )
-
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(
-    name="sell",
-    description="Sell a specific number of shares or your entire position."
-    )
-    @app_commands.describe(
-    quantity="Number of shares to sell, or 'all' to sell your entire position."
-
-    )
-    async def sell(
-        self,
-        interaction: discord.Interaction,
-        symbol: str,
-        quantity: str
-    ):
-        discord_id = str(interaction.user.id)
-        symbol = symbol.upper().strip()
-        quantity = quantity.strip().lower()
-
-        try:
-            if quantity != "all":
-                quantity = Decimal(quantity)
-
-            price_data = get_or_update_price(
-                symbol,
-                date.today().isoformat()
+        if summary is None:
+            await interaction.edit_original_response(
+                content="Not enough history yet. Stats start after your second daily snapshot."
+            )
+        else:
+            await interaction.edit_original_response(
+                embed=embeds.stats_embed(interaction.user.name, summary)
             )
 
-            result = sell_stock(
-                discord_id,
-                symbol,
-                quantity,
-                price_data["price"],
-                price_data["price_date"]
+    @app_commands.command(name="trades", description="Your 10 most recent trades.")
+    async def trades(self, interaction: discord.Interaction):
+        trades = await run_blocking(
+            interaction, portfolio.get_recent_trades, str(interaction.user.id), public=False
+        )
+        if trades is not FAILED:
+            await interaction.edit_original_response(
+                embed=embeds.trades_embed(interaction.user.name, trades)
             )
 
-        except (ValueError, RuntimeError) as error:
-            await interaction.response.send_message(
-                f"Sale unsuccessful: {error}",
-                ephemeral=True
-            )
+    @app_commands.command(name="admin-update", description="Run the daily price and snapshot job now.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_update(self, interaction: discord.Interaction):
+        result = await run_blocking(interaction, run_daily_market_update, public=False)
+        if result is FAILED:
             return
 
-        gross_proceeds = result["gross_amount_cents"] / 100
-        fee = result["fee_cents"] / 100
-        net_proceeds = result["net_proceeds_cents"] / 100
-
-        embed = discord.Embed(
-            title="Sale Successful",
-            color=discord.Color.green()
+        text = (
+            f"{result['snapshot_date']} was not a trading day. Nothing saved."
+            if result["skipped"] else
+            f"Snapshots saved for {len(result['snapshots_saved'])} players on "
+            f"{result['snapshot_date']}.\n"
+            f"Price failures: {result['price_updates']['failed'] or 'none'}\n"
+            f"Snapshot failures: {result['snapshot_failures'] or 'none'}"
         )
+        await interaction.edit_original_response(content=text)
 
-        embed.add_field(name="Stock", value=result["symbol"], inline=True)
-        embed.add_field(
-            name="Shares Sold",
-            value=f"{result['quantity']:,.8f}",
-            inline=True
+    @app_commands.command(name="admin-check", description="Check that cash matches the trade ledger.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_check(self, interaction: discord.Interaction):
+        mismatches = await run_blocking(
+            interaction, portfolio.find_cash_mismatches, public=False
         )
-        embed.add_field(
-            name="Price Per Share",
-            value=f"${result['price_per_share']:,.2f}",
-            inline=True
-        )
-        embed.add_field(
-            name="Gross Proceeds",
-            value=f"${gross_proceeds:,.2f}",
-            inline=True
-        )
-        embed.add_field(
-            name="Transaction Fee",
-            value=f"${fee:,.2f}",
-            inline=True
-        )
-        embed.add_field(
-            name="Net Proceeds",
-            value=f"${net_proceeds:,.2f}",
-            inline=True
-        )
-
-        embed.set_footer(
-            text=f"Execution price from {price_data['price_date']}"
-        )
-
-        await interaction.response.send_message(embed=embed)
-
-
-    @app_commands.command(
-        name="sell-amount",
-        description="Sell stock using a dollar amount."
-    )
-    async def sell_amount(
-        self,
-        interaction: discord.Interaction,
-        symbol: str,
-        amount: float
-    ):
-        discord_id = str(interaction.user.id)
-        symbol = symbol.upper().strip()
-
-        try:
-            price_data = get_or_update_price(
-                symbol,
-                date.today().isoformat()
-            )
-
-            result = sell_stock_by_amount(
-                discord_id,
-                symbol,
-                Decimal(str(amount)),
-                price_data["price"],
-                price_data["price_date"]
-            )
-
-        except (ValueError, RuntimeError) as error:
-            await interaction.response.send_message(
-                f"Sale unsuccessful: {error}",
-                ephemeral=True
-            )
+        if mismatches is FAILED:
             return
 
-        gross_proceeds = result["gross_amount_cents"] / 100
-        fee = result["fee_cents"] / 100
-        net_proceeds = result["net_proceeds_cents"] / 100
-
-        embed = discord.Embed(
-            title="Sale Successful",
-            color=discord.Color.green()
+        text = "Every balance matches the ledger." if not mismatches else "\n".join(
+            f"{m['username']}: stored ${m['stored_cents'] / 100:,.2f}, "
+            f"ledger says ${m['expected_cents'] / 100:,.2f}"
+            for m in mismatches
         )
+        await interaction.edit_original_response(content=text)
 
-        embed.add_field(
-            name="Stock",
-            value=result["symbol"],
-            inline=True
-        )
 
-        embed.add_field(
-            name="Shares Sold",
-            value=f"{result['quantity']:,.8f}",
-            inline=True
-        )
+async def on_app_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Slow down. Try again in {error.retry_after:.0f} seconds."
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "Only server admins can use that command."
+    else:
+        logger.exception("Unhandled command error", exc_info=error)
+        message = "Something went wrong on my end. Try again in a moment."
 
-        embed.add_field(
-            name="Price Per Share",
-            value=f"${result['price_per_share']:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Gross Proceeds",
-            value=f"${gross_proceeds:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Transaction Fee",
-            value=f"${fee:,.2f}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="Net Proceeds",
-            value=f"${net_proceeds:,.2f}",
-            inline=True
-        )
-
-        embed.set_footer(
-            text=f"Execution price from {price_data['price_date']}"
-        )
-
-        await interaction.response.send_message(embed=embed)
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 async def setup(bot):
+    bot.tree.on_error = on_app_command_error
     await bot.add_cog(TradingCommands(bot))
