@@ -39,13 +39,11 @@ upgraded automatically.
 ## Trading rules
 
 - Orders fill at the last official close, with a 0.10% fee on each trade.
-- Trading is closed from 9:30 am to 4:15 pm ET on trading days. That way
-  nobody can trade at yesterday's close after reading today's news.
+- Trading is closed from 9:30 am to 4:15 pm ET on trading days.
   To turn this off while testing, run
   `UPDATE league_settings SET execution_model = 'any_time'`.
-- Minimum purchase is $1.00. No shorting. Shares can be fractional.
-- Holidays come from a built-in NYSE calendar. Early-close days are treated as
-  normal days.
+- Minimum purchase is $1.00. Shares can be fractional.
+- Holidays come from NYSE calendar.
 
 ## How it works
 
@@ -76,11 +74,3 @@ tests/
 python -m pytest
 ```
 
-## Known gaps
-
-- Stock splits and dividends are not handled. A split will show as a false
-  loss. The SPY benchmark uses plain closes so the comparison stays fair.
-- Yahoo Finance is unofficial and can rate limit. All downloading goes through
-  `fetch_daily_prices` in `core/prices.py`, so it can be swapped out.
-- Share quantities are stored as text, so holdings are summed in Python.
-  Fine for a friend group. Switch to integer units if the trade table grows large.
