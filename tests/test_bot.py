@@ -32,6 +32,7 @@ FILL = {
     "symbol": "AAPL", "side": "BUY", "quantity": Decimal("2"),
     "price_per_share": Decimal("100"), "gross_amount_cents": 20_000,
     "fee_cents": 20, "cash_change_cents": 20_020, "price_date": "2026-11-16",
+    "filled_live": False,
 }
 
 
@@ -131,7 +132,8 @@ def test_fit_lines_keeps_everything_when_it_fits():
 def test_portfolio_embed_stays_inside_discord_limits():
     holdings = {
         f"SYM{i}": {"quantity": Decimal("10"), "price": Decimal("123.45"),
-                    "price_date": "2026-11-16", "market_value": Decimal("1234.50")}
+                    "price_date": "2026-11-16", "live": False,
+                    "market_value": Decimal("1234.50")}
         for i in range(40)
     }
     result = {"username": "Tester", "cash_balance": Decimal("1000"),
@@ -162,3 +164,51 @@ def test_stats_embed_handles_missing_values():
 ])
 def test_share_formatting(quantity, shown):
     assert embeds.shares(quantity) == shown
+
+
+def test_trade_embed_says_when_the_fill_was_live():
+    live = embeds.trade_embed({**FILL, "filled_live": True})
+    closed = embeds.trade_embed(FILL)
+
+    assert live.footer.text == "Filled at the live price"
+    assert closed.footer.text == "Filled at the 2026-11-16 close"
+
+
+def test_portfolio_embed_footer_shows_live_prices():
+    holding = {"quantity": Decimal("1"), "price": Decimal("100"), "price_date": "2026-11-16",
+               "live": True, "market_value": Decimal("100")}
+    result = {"username": "Tester", "cash_balance": Decimal("0"), "holdings_value": Decimal("100"),
+              "total_value": Decimal("100"), "holdings": {"AAPL": holding}}
+
+    assert "Live prices" in embeds.portfolio_embed(result).footer.text
+
+
+def test_admin_mode_switches_the_pricing_model(monkeypatch):
+    from discord import app_commands
+
+    chosen = []
+    monkeypatch.setattr(execution, "set_execution_model", chosen.append)
+    interaction = make_interaction()
+    choice = app_commands.Choice(name="Live quotes during the session", value="live_quote")
+
+    call(bot_commands.TradingCommands.admin_mode, interaction, choice)
+
+    assert chosen == ["live_quote"]
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Trades now use: Live quotes during the session."
+    )
+
+
+def test_admin_mode_reports_a_bad_value(monkeypatch):
+    from discord import app_commands
+
+    def refuse(model):
+        raise ValueError("Model must be one of: any_time, daily_close, live_quote.")
+
+    monkeypatch.setattr(execution, "set_execution_model", refuse)
+    interaction = make_interaction()
+
+    call(bot_commands.TradingCommands.admin_mode, interaction,
+         app_commands.Choice(name="x", value="x"))
+
+    assert "Model must be one of" in interaction.edit_original_response.await_args.kwargs["content"]

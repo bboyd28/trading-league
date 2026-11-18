@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from core.database import get_connection, get_league_settings
 from core.prices import (
     get_latest_prices,
+    get_live_prices,
     get_prices_on_or_before,
     normalize_symbol,
 )
@@ -317,18 +318,32 @@ def _value_holdings(holdings, prices):
             "quantity": quantity,
             "price": price["price"],
             "price_date": price["price_date"],
+            "live": price.get("live", False),
             "market_value": quantity * price["price"],
         }
 
     return valued
 
 
-def get_valued_portfolio(discord_id):
-    """Portfolio valued at the latest stored closes."""
+def get_valued_portfolio(discord_id, live=False):
+    """Portfolio valued at the latest stored closes, or live prices if asked.
+
+    If live quotes can't be had, it falls back to the stored closes.
+    """
     portfolio = get_portfolio(discord_id)
-    holdings = _value_holdings(
-        portfolio["holdings"], get_latest_prices(portfolio["holdings"])
-    )
+    symbols = portfolio["holdings"]
+    prices = None
+
+    if live and symbols:
+        try:
+            prices = get_live_prices(symbols)
+        except (ValueError, RuntimeError):
+            prices = None
+
+    if prices is None:
+        prices = get_latest_prices(symbols)
+
+    holdings = _value_holdings(portfolio["holdings"], prices)
     holdings_value = sum((h["market_value"] for h in holdings.values()), Decimal(0))
 
     return {

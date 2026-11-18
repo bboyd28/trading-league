@@ -6,25 +6,58 @@ too, so the trading rules (window, price source) live in one spot.
 from core import portfolio
 from core.database import get_connection, get_league_settings
 from core.market_calendar import (
+    SETTLING_MESSAGE,
     WINDOW_MESSAGE,
+    closing_prices_settling,
     last_completed_session,
+    market_in_session,
     now_eastern,
     trading_window_open,
 )
-from core.prices import get_execution_price, normalize_symbol
+from core.prices import get_execution_price, get_live_price, normalize_symbol
 
-EXECUTION_MODELS = {"daily_close", "any_time"}
+# daily_close: fills at the last close, only while the market is closed
+# live_quote:  fills at the live price during the session, last close otherwise
+# any_time:    fills at the last close at any hour (for testing)
+EXECUTION_MODELS = {"daily_close", "live_quote", "any_time"}
 
 
-def _check_trading_window(now):
+def get_execution_model():
     with get_connection() as connection:
         model = get_league_settings(connection)["execution_model"]
 
     if model not in EXECUTION_MODELS:
         raise RuntimeError(f"Unknown execution model '{model}'.")
 
+    return model
+
+
+def set_execution_model(model):
+    if model not in EXECUTION_MODELS:
+        raise ValueError(f"Model must be one of: {', '.join(sorted(EXECUTION_MODELS))}.")
+
+    with get_connection(write=True) as connection:
+        connection.execute("UPDATE league_settings SET execution_model = ?", (model,))
+
+
+def live_prices_enabled(now=None):
+    """True when portfolios should be valued at live quotes right now."""
+    return get_execution_model() == "live_quote" and market_in_session(now)
+
+
+def _check_trading_window(model, now):
     if model == "daily_close" and not trading_window_open(now):
         raise ValueError(WINDOW_MESSAGE)
+
+    if model == "live_quote" and closing_prices_settling(now):
+        raise ValueError(SETTLING_MESSAGE)
+
+
+def _fill_price(symbol, model, now):
+    if model == "live_quote" and market_in_session(now):
+        return get_live_price(symbol, now)
+
+    return get_execution_price(symbol, now)
 
 
 def place_order(discord_id, symbol, side, *, quantity=None, amount=None, now=None):
@@ -49,8 +82,9 @@ def place_order(discord_id, symbol, side, *, quantity=None, amount=None, now=Non
     if not sell_all and (quantity is None) == (amount is None):
         raise ValueError("Give either a quantity or a dollar amount.")
 
-    _check_trading_window(now)
-    price = get_execution_price(symbol, now)
+    model = get_execution_model()
+    _check_trading_window(model, now)
+    price = _fill_price(symbol, model, now)
     args = (discord_id, symbol)
     fill = (price["price"], price["price_date"])
 
@@ -69,6 +103,7 @@ def place_order(discord_id, symbol, side, *, quantity=None, amount=None, now=Non
         **result,
         "side": side,
         "price_date": price["price_date"],
+        "filled_live": bool(price.get("live")),
         "cash_change_cents": cash_change,
     }
 

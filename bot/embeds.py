@@ -63,9 +63,11 @@ def portfolio_embed(result):
         inline=False,
     )
 
-    dates = {h["price_date"] for h in result["holdings"].values()}
-    if dates:
-        embed.set_footer(text=f"Prices as of {max(dates)}")
+    positions = result["holdings"].values()
+    if any(h["live"] for h in positions):
+        embed.set_footer(text="Live prices (IEX quotes)")
+    elif positions:
+        embed.set_footer(text=f"Prices as of {max(h['price_date'] for h in positions)} close")
 
     return embed
 
@@ -85,7 +87,10 @@ def trade_embed(result):
         name="Total cost" if bought else "Net proceeds",
         value=money(result["cash_change_cents"] / 100),
     )
-    embed.set_footer(text=f"Filled at the {result['price_date']} close")
+    if result["filled_live"]:
+        embed.set_footer(text="Filled at the live price")
+    else:
+        embed.set_footer(text=f"Filled at the {result['price_date']} close")
     return embed
 
 

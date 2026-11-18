@@ -8,12 +8,18 @@ from zoneinfo import ZoneInfo
 
 EASTERN = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
+MARKET_CLOSE = time(16, 0)
 # Yahoo's daily bar isn't final right at 4:00 pm, so wait 15 minutes.
 CLOSE_SETTLED = time(16, 15)
 
 WINDOW_MESSAGE = (
     "The market is open. Trading is closed from 9:30 am to 4:15 pm ET "
     "on trading days so nobody can trade on stale prices."
+)
+
+
+SETTLING_MESSAGE = (
+    "The closing prices are being finalized. Trading reopens at 4:15 pm ET."
 )
 
 
@@ -117,11 +123,17 @@ def last_completed_session(now=None):
     return previous_trading_day(today)
 
 
-def trading_window_open(now=None):
-    """True when orders are allowed (the market is not in session)."""
+def market_in_session(now=None):
     now = now or now_eastern()
-    in_session = (
-        is_trading_day(now.date())
-        and MARKET_OPEN <= now.time() < CLOSE_SETTLED
-    )
-    return not in_session
+    return is_trading_day(now.date()) and MARKET_OPEN <= now.time() < MARKET_CLOSE
+
+
+def closing_prices_settling(now=None):
+    """The 15 minutes after the close, before the official close is final."""
+    now = now or now_eastern()
+    return is_trading_day(now.date()) and MARKET_CLOSE <= now.time() < CLOSE_SETTLED
+
+
+def trading_window_open(now=None):
+    """True when orders are allowed under the 'daily_close' model."""
+    return not (market_in_session(now) or closing_prices_settling(now))

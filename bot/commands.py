@@ -56,9 +56,11 @@ class TradingCommands(commands.Cog):
 
     @app_commands.command(name="portfolio", description="View your portfolio.")
     async def portfolio(self, interaction: discord.Interaction):
-        result = await run_blocking(
-            interaction, portfolio.get_valued_portfolio, str(interaction.user.id)
-        )
+        def load():
+            live = execution.live_prices_enabled()
+            return portfolio.get_valued_portfolio(str(interaction.user.id), live=live)
+
+        result = await run_blocking(interaction, load)
         if result is not FAILED:
             await interaction.edit_original_response(embed=embeds.portfolio_embed(result))
 
@@ -165,6 +167,23 @@ class TradingCommands(commands.Cog):
             f"Snapshot failures: {result['snapshot_failures'] or 'none'}"
         )
         await interaction.edit_original_response(content=text)
+
+    @app_commands.command(name="admin-mode", description="Choose how trades are priced.")
+    @app_commands.describe(model="Pricing model")
+    @app_commands.choices(model=[
+        app_commands.Choice(name="Live quotes during the session", value="live_quote"),
+        app_commands.Choice(name="Last close, market closed only", value="daily_close"),
+        app_commands.Choice(name="Last close, any time (testing)", value="any_time"),
+    ])
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_mode(self, interaction: discord.Interaction,
+                         model: app_commands.Choice[str]):
+        done = await run_blocking(
+            interaction, execution.set_execution_model, model.value, public=False
+        )
+        if done is not FAILED:
+            await interaction.edit_original_response(content=f"Trades now use: {model.name}.")
 
     @app_commands.command(name="admin-check", description="Check that cash matches the trade ledger.")
     @app_commands.default_permissions(administrator=True)

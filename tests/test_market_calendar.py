@@ -6,7 +6,9 @@ from core.market_calendar import (
     EASTERN,
     holidays,
     is_trading_day,
+    closing_prices_settling,
     last_completed_session,
+    market_in_session,
     previous_trading_day,
     trading_days_between,
     trading_window_open,
@@ -79,3 +81,18 @@ def test_last_completed_session(now, expected):
 ])
 def test_trading_window(now, open_for_orders):
     assert trading_window_open(now) is open_for_orders
+
+
+@pytest.mark.parametrize("now, in_session, settling", [
+    (eastern(2026, 11, 16, 9, 29), False, False),
+    (eastern(2026, 11, 16, 9, 30), True, False),
+    (eastern(2026, 11, 16, 15, 59), True, False),
+    (eastern(2026, 11, 16, 16, 0), False, True),
+    (eastern(2026, 11, 16, 16, 14), False, True),
+    (eastern(2026, 11, 16, 16, 15), False, False),
+    (eastern(2026, 11, 14, 11, 0), False, False),     # Saturday
+    (eastern(2026, 11, 26, 16, 5), False, False),     # Thanksgiving
+])
+def test_session_and_settling_windows(now, in_session, settling):
+    assert market_in_session(now) is in_session
+    assert closing_prices_settling(now) is settling
