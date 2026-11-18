@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
@@ -6,6 +6,7 @@ import pytest
 
 import core.database as database
 import core.prices as prices
+import core.providers as providers
 from core.market_calendar import EASTERN
 
 MONDAY_EVENING = datetime(2026, 11, 16, 17, 0, tzinfo=EASTERN)
@@ -62,7 +63,7 @@ def test_fetch_drops_unfinished_session(monkeypatch):
         ("2026-11-13", 101.0, 101.0),
         ("2026-11-16", 102.0, 102.0),   # today's live bar
     ])
-    monkeypatch.setattr(prices.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(providers.yf, "Ticker", FakeTicker)
 
     result = prices.fetch_daily_prices("AAPL", now=MONDAY_MIDDAY)
 
@@ -71,7 +72,7 @@ def test_fetch_drops_unfinished_session(monkeypatch):
 
 def test_fetch_keeps_today_after_the_close_settles(monkeypatch):
     FakeTicker.frame = make_frame([("2026-11-13", 101.0, 101.0), ("2026-11-16", 102.0, 102.0)])
-    monkeypatch.setattr(prices.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(providers.yf, "Ticker", FakeTicker)
 
     result = prices.fetch_daily_prices("AAPL", now=MONDAY_EVENING)
 
@@ -80,7 +81,7 @@ def test_fetch_keeps_today_after_the_close_settles(monkeypatch):
 
 def test_fetch_empty_result_is_a_value_error(monkeypatch):
     FakeTicker.frame = pd.DataFrame()
-    monkeypatch.setattr(prices.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(providers.yf, "Ticker", FakeTicker)
 
     with pytest.raises(ValueError, match="No price data found"):
         prices.fetch_daily_prices("ZZZZ")
@@ -91,9 +92,9 @@ def test_fetch_wraps_provider_errors(monkeypatch):
         def history(self, **kwargs):
             raise ConnectionError("offline")
 
-    monkeypatch.setattr(prices.yf, "Ticker", Broken)
+    monkeypatch.setattr(providers.yf, "Ticker", Broken)
 
-    with pytest.raises(RuntimeError, match="Could not reach the price provider"):
+    with pytest.raises(RuntimeError, match="Could not reach Yahoo Finance"):
         prices.fetch_daily_prices("AAPL")
 
 
@@ -210,3 +211,54 @@ def test_refresh_cooldown_limits_downloads(setup_database, monkeypatch):
             prices.get_execution_price("AAPL", MONDAY_EVENING)
 
     assert calls == ["AAPL"]
+
+
+# ---- live prices ---------------------------------------------------------
+
+class FakeProvider:
+    def __init__(self, price="100.123456", age_seconds=5):
+        self.price = Decimal(price)
+        self.age = timedelta(seconds=age_seconds)
+        self.calls = 0
+
+    def latest_price(self, symbol):
+        self.calls += 1
+        return self.price, MONDAY_MIDDAY - self.age
+
+
+def test_live_price_is_rounded_and_dated_today(monkeypatch):
+    monkeypatch.setattr(prices, "get_provider", lambda: FakeProvider())
+
+    result = prices.get_live_price("aapl", MONDAY_MIDDAY)
+
+    assert result == {
+        "symbol": "AAPL", "price": Decimal("100.1235"),
+        "price_date": "2026-11-16", "live": True,
+    }
+
+
+def test_live_price_refuses_an_old_quote(monkeypatch):
+    monkeypatch.setattr(prices, "get_provider", lambda: FakeProvider(age_seconds=1200))
+
+    with pytest.raises(ValueError, match="20 minutes old"):
+        prices.get_live_price("AAPL", MONDAY_MIDDAY)
+
+
+def test_live_price_is_cached_briefly(monkeypatch):
+    provider = FakeProvider()
+    monkeypatch.setattr(prices, "get_provider", lambda: provider)
+
+    prices.get_live_price("AAPL", MONDAY_MIDDAY)
+    prices.get_live_price("AAPL", MONDAY_MIDDAY)
+    prices.get_live_price("MSFT", MONDAY_MIDDAY)
+
+    assert provider.calls == 2
+
+
+def test_live_prices_for_several_symbols(monkeypatch):
+    monkeypatch.setattr(prices, "get_provider", lambda: FakeProvider("50"))
+
+    found = prices.get_live_prices(["AAPL", "MSFT"], MONDAY_MIDDAY)
+
+    assert set(found) == {"AAPL", "MSFT"}
+    assert found["MSFT"]["price"] == Decimal("50")

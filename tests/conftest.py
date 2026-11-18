@@ -2,6 +2,7 @@ import pytest
 
 import core.database as database
 import core.prices as prices
+import core.providers as providers
 
 
 @pytest.fixture
@@ -14,5 +15,15 @@ def setup_database(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def reset_refresh_cooldown(monkeypatch):
+def clean_price_state(monkeypatch):
+    """No leftover cooldowns, quotes, or provider settings between tests."""
     monkeypatch.setattr(prices, "_last_refresh", {})
+    monkeypatch.setattr(prices, "_quote_cache", {})
+
+    for name in ("ALPACA_API_KEY", "ALPACA_API_SECRET", "PRICE_PROVIDER",
+                 "ALPACA_BARS_FEED", "ALPACA_LIVE_FEED"):
+        monkeypatch.delenv(name, raising=False)
+
+    providers.reset_provider()
+    yield
+    providers.reset_provider()

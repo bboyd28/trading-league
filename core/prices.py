@@ -1,7 +1,6 @@
-"""Daily price download (Yahoo Finance) and stored price lookups.
+"""Stored daily closes, plus live quotes while the market is open.
 
-fetch_daily_prices is the only function that talks to Yahoo. To switch to
-another data source later, replace that one function.
+All network calls go through the provider in core/providers.py.
 """
 import logging
 import re
@@ -9,18 +8,21 @@ import time
 from decimal import Decimal
 
 import pandas as pd
-import yfinance as yf
 
 from core.database import get_connection
-from core.market_calendar import last_completed_session
+from core.market_calendar import last_completed_session, now_eastern
+from core.providers import get_provider
 
 logger = logging.getLogger(__name__)
 
 SYMBOL_PATTERN = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 PRICE_PLACES = Decimal("0.0001")
 REFRESH_COOLDOWN_SECONDS = 300
+QUOTE_CACHE_SECONDS = 5
+MAX_QUOTE_AGE_SECONDS = 600
 
 _last_refresh = {}
+_quote_cache = {}
 
 
 def normalize_symbol(symbol):
@@ -35,23 +37,10 @@ def normalize_symbol(symbol):
 def fetch_daily_prices(symbol, period="1mo", now=None):
     """Download daily closes, leaving out any session that isn't final yet."""
     symbol = normalize_symbol(symbol)
+    prices = get_provider().daily_bars(symbol, period)
+    prices = prices.dropna(subset=["Close"])
 
-    try:
-        prices = yf.Ticker(symbol).history(
-            period=period, interval="1d", auto_adjust=False, actions=False
-        )
-    except Exception as error:
-        raise RuntimeError(f"Could not reach the price provider: {error}") from error
-
-    if prices.empty:
-        raise ValueError(f"No price data found for {symbol}.")
-
-    if not {"Close", "Adj Close"}.issubset(prices.columns):
-        raise RuntimeError("Expected price columns were not returned.")
-
-    prices = prices[["Close", "Adj Close"]].dropna(subset=["Close"])
-
-    # While the market is open Yahoo includes today's unfinished bar.
+    # Providers can include today's unfinished bar while the market is open.
     cutoff = last_completed_session(now)
     prices = prices[[stamp.date() <= cutoff for stamp in prices.index]]
 
@@ -174,3 +163,39 @@ def get_execution_price(symbol, now=None):
         )
 
     return latest
+
+
+def get_live_price(symbol, now=None):
+    """Current price while the market is open, cached for a few seconds.
+
+    Raises if the quote is too old to trust (quiet stocks on a one-exchange
+    feed can go minutes without an update).
+    """
+    symbol = normalize_symbol(symbol)
+    now = now or now_eastern()
+    cached = _quote_cache.get(symbol)
+
+    if cached and time.monotonic() - cached["fetched"] < QUOTE_CACHE_SECONDS:
+        return cached["result"]
+
+    price, quoted_at = get_provider().latest_price(symbol)
+    age = (now - quoted_at).total_seconds()
+
+    if age > MAX_QUOTE_AGE_SECONDS:
+        raise ValueError(
+            f"The latest {symbol} price is {age / 60:.0f} minutes old. "
+            "Try again shortly, or pick a more actively traded stock."
+        )
+
+    result = {
+        "symbol": symbol,
+        "price": price.quantize(PRICE_PLACES),
+        "price_date": now.date().isoformat(),
+        "live": True,
+    }
+    _quote_cache[symbol] = {"fetched": time.monotonic(), "result": result}
+    return result
+
+
+def get_live_prices(symbols, now=None):
+    return {symbol: get_live_price(symbol, now) for symbol in symbols}

@@ -13,6 +13,7 @@ import core.leaderboard as leaderboard
 import core.market_updates as market_updates
 import core.portfolio as portfolio
 import core.prices as prices
+import core.providers as providers
 from core.market_calendar import EASTERN
 
 FRIDAY_EVENING = datetime(2026, 11, 13, 17, 0, tzinfo=EASTERN)
@@ -36,7 +37,7 @@ class FakeYahoo:
 
 
 def test_a_full_league_day(setup_database, monkeypatch):
-    monkeypatch.setattr(prices.yf, "Ticker", FakeYahoo)
+    monkeypatch.setattr(providers.yf, "Ticker", FakeYahoo)
     monkeypatch.setattr(prices, "last_completed_session", lambda now=None: date(2026, 11, 16))
 
     # Friday evening: join and get a day-zero snapshot.

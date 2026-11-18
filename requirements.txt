@@ -1,6 +1,7 @@
 discord.py
 python-dotenv
 yfinance
+requests
 pandas
 numpy
 tzdata
